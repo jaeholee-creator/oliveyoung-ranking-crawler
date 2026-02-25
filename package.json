@@ -1,0 +1,12 @@
+{
+  "name": "oliveyoung-ranking-crawler",
+  "version": "1.0.0",
+  "description": "올리브영 판매 랭킹 크롤러 + BigQuery 파이프라인",
+  "scripts": {
+    "crawl": "node scripts/collect_ranking_playwright.js --category-limit 21 --category-wait-ms 2200",
+    "load-bq": "python3 scripts/load_to_bigquery.py"
+  },
+  "dependencies": {
+    "playwright": "^1.50.0"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+output/
+*.json
+!package.json
+!package-lock.json
+!bq/*.py
+.env
+*.log
+__pycache__/
+*.pyc
