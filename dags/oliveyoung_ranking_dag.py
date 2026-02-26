@@ -3,6 +3,7 @@
 
 - 스케줄: 매시 30분
 - 파이프라인: 크롤링(patchright) → BigQuery 적재(Python) → 정리 → Slack 알림
+- 0건 수집 시 실패 처리 (crawl_ranking exit 1 → Airflow retry)
 """
 
 from datetime import datetime, timedelta
@@ -30,13 +31,16 @@ TARGET_URL = (
     "%20%EC%83%81%EC%84%B8&t_click=GNB&t_gnb_type=%EB%9E%AD%ED%82%B9&t_swiping_type=N"
 )
 
+# 최소 수집 건수 (미달 시 크롤러가 exit 1 → Airflow가 retry)
+MIN_ROWS = 100
+
 default_args = {
     "owner": "jaeho",
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
     "retries": 2,
-    "retry_delay": timedelta(minutes=3),
+    "retry_delay": timedelta(minutes=5),
 }
 
 dag = DAG(
@@ -51,15 +55,17 @@ dag = DAG(
 )
 
 
-# Task 1: patchright(Scrapling)로 랭킹 크롤링
+# Task 1: patchright로 랭킹 크롤링 (DISPLAY=:99 + headless=False)
 crawl_ranking = BashOperator(
     task_id="crawl_ranking",
     bash_command=(
+        f"export DISPLAY=:99 && "
         f"cd {PROJECT_DIR} && "
         f"{PYTHON_BIN} scripts/collect_ranking_scrapling.py "
         f'--url "{TARGET_URL}" '
         f"--category-limit {CATEGORY_LIMIT} "
         f"--category-wait-ms {CATEGORY_WAIT_MS} "
+        f"--min-rows {MIN_ROWS} "
         f"--out-dir output/ranking_playwright"
     ),
     execution_timeout=timedelta(minutes=10),
@@ -85,16 +91,21 @@ def _load_latest_to_bigquery(**context):
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"JSON 파일 없음: {json_path}")
 
+    # JSON 파일 로드하여 건수 확인
+    with open(json_path) as f:
+        rows = json.load(f)
+
+    if not rows:
+        raise ValueError(f"수집 데이터 0건 — BQ 적재 스킵: {json_path}")
+
     from load_to_bigquery import load_to_bigquery
     row_count = load_to_bigquery(json_path)
 
-    # XCom으로 메타데이터 전달
     context["ti"].xcom_push(key="loaded_rows", value=row_count)
     context["ti"].xcom_push(key="source_dir", value=latest_dir)
     return row_count
 
 
-# Task 2: BigQuery 적재
 load_to_bq = PythonOperator(
     task_id="load_to_bigquery",
     python_callable=_load_latest_to_bigquery,
@@ -124,7 +135,6 @@ def _cleanup_old_runs(**context):
     return removed
 
 
-# Task 3: 오래된 로컬 데이터 정리
 cleanup = PythonOperator(
     task_id="cleanup_old_runs",
     python_callable=_cleanup_old_runs,
@@ -165,7 +175,7 @@ def _send_slack_notification(**context):
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*BigQuery 테이블*\n`member-378109.jaeho.oliveyoung_ranking`",
+                "text": "*BigQuery 테이블*\n`member-378109.jaeho.oliveyoung_ranking`",
             },
         },
         {
@@ -201,7 +211,6 @@ def _send_slack_notification(**context):
     print(f"Slack 알림 발송 완료: channel={SLACK_CHANNEL_ID}")
 
 
-# Task 4: Slack 알림
 notify_slack = PythonOperator(
     task_id="notify_slack",
     python_callable=_send_slack_notification,
