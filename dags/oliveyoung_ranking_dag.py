@@ -1,8 +1,8 @@
 """
 올리브영 판매 랭킹 수집 DAG
 
-- 스케줄: 매정시, 매 30분 (0,30분)
-- 파이프라인: 크롤링(Node.js) → BigQuery 적재(Python) → Slack 알림
+- 스케줄: 매시 30분
+- 파이프라인: 크롤링(patchright) → BigQuery 적재(Python) → 정리 → Slack 알림
 """
 
 from datetime import datetime, timedelta
@@ -22,6 +22,7 @@ CATEGORY_LIMIT = int(Variable.get("oliveyoung_category_limit", default_var="21")
 CATEGORY_WAIT_MS = int(Variable.get("oliveyoung_category_wait_ms", default_var="2200"))
 SLACK_BOT_TOKEN = Variable.get("slack_bot_token", default_var="")
 SLACK_CHANNEL_ID = Variable.get("slack_channel_id", default_var="C0ACH02BLG5")
+PYTHON_BIN = Variable.get("oliveyoung_python_bin", default_var="/home/ubuntu/airflow-venv/bin/python3")
 
 TARGET_URL = (
     "https://www.oliveyoung.co.kr/store/main/getBestList.do?"
@@ -41,8 +42,8 @@ default_args = {
 dag = DAG(
     dag_id="oliveyoung_ranking_collector",
     default_args=default_args,
-    description="올리브영 판매 랭킹 수집 및 BigQuery 적재 (30분 간격)",
-    schedule_interval="0,30 * * * *",
+    description="올리브영 판매 랭킹 수집 및 BigQuery 적재 (매시 30분)",
+    schedule_interval="30 * * * *",
     start_date=datetime(2026, 2, 25),
     catchup=False,
     max_active_runs=1,
@@ -50,12 +51,12 @@ dag = DAG(
 )
 
 
-# Task 1: Playwright로 랭킹 크롤링
+# Task 1: patchright(Scrapling)로 랭킹 크롤링
 crawl_ranking = BashOperator(
     task_id="crawl_ranking",
     bash_command=(
         f"cd {PROJECT_DIR} && "
-        f"node scripts/collect_ranking_playwright.js "
+        f"{PYTHON_BIN} scripts/collect_ranking_scrapling.py "
         f'--url "{TARGET_URL}" '
         f"--category-limit {CATEGORY_LIMIT} "
         f"--category-wait-ms {CATEGORY_WAIT_MS} "
@@ -132,7 +133,11 @@ cleanup = PythonOperator(
 )
 
 def _send_slack_notification(**context):
-    """DAG 실행 결과를 Slack으로 발송"""
+    """DAG 실행 결과를 Slack으로 발송 (토큰 없으면 스킵)"""
+    if not SLACK_BOT_TOKEN:
+        print("SLACK_BOT_TOKEN이 설정되지 않아 알림을 스킵합니다.")
+        return
+
     ti = context["ti"]
     loaded_rows = ti.xcom_pull(task_ids="load_to_bigquery", key="loaded_rows") or 0
     source_dir = ti.xcom_pull(task_ids="load_to_bigquery", key="source_dir") or ""
@@ -168,7 +173,7 @@ def _send_slack_notification(**context):
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": "📊 Airflow DAG: `oliveyoung_ranking_collector` | 30분 간격 자동 수집",
+                    "text": "📊 Airflow DAG: `oliveyoung_ranking_collector` | 매시 30분 자동 수집",
                 }
             ],
         },
