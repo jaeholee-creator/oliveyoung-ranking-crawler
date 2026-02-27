@@ -191,25 +191,27 @@ def fetch_review_stats(context: Any, goods_nos: list[str]) -> dict[str, dict]:
     """별도 페이지에서 리뷰 통계 API URL을 순차 방문하여 JSON 파싱.
 
     동일 브라우저 context이므로 CF 쿠키 자동 공유.
-    건당 300ms 딜레이로 서버 부하 방지.
     """
+    total = len(goods_nos)
     results: dict[str, dict] = {}
+    fails = 0
     review_page = context.new_page()
     try:
         for i, gno in enumerate(goods_nos):
             url = f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{gno}/stats"
             try:
-                review_page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                body = review_page.locator("body").inner_text(timeout=5000)
+                review_page.goto(url, wait_until="domcontentloaded", timeout=8000)
+                body = review_page.locator("body").inner_text(timeout=3000)
                 data = json.loads(body)
                 rc = data.get("data", {}).get("reviewCount")
                 avg = data.get("data", {}).get("ratingDistribution", {}).get("averageRating")
                 if rc is not None or avg is not None:
                     results[gno] = {"review_count": rc, "rating": avg}
             except Exception:
-                pass  # 개별 실패는 무시
-            if i < len(goods_nos) - 1:
-                time.sleep(0.3)
+                fails += 1
+            # 진행 로그 (100건마다 + 마지막)
+            if (i + 1) % 100 == 0 or i + 1 == total:
+                print(f"[INFO] 리뷰 API 진행: {i + 1}/{total} (성공 {len(results)}, 실패 {fails})")
     finally:
         review_page.close()
     return results

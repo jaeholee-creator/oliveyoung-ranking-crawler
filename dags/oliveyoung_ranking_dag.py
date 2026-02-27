@@ -70,7 +70,7 @@ crawl_ranking = BashOperator(
         f"--min-rows {MIN_ROWS} "
         f"--out-dir output/ranking_playwright"
     ),
-    execution_timeout=timedelta(minutes=20),
+    execution_timeout=timedelta(minutes=25),
     dag=dag,
 )
 
