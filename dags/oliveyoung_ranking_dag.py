@@ -105,6 +105,18 @@ def _load_latest_to_bigquery(**context):
 
     context["ti"].xcom_push(key="loaded_rows", value=row_count)
     context["ti"].xcom_push(key="source_dir", value=latest_dir)
+
+    # 리뷰 통계 xcom push
+    summary_path = os.path.join(latest_dir, "summary.json")
+    if os.path.exists(summary_path):
+        with open(summary_path) as f:
+            summary = json.load(f)
+        rv = summary.get("reviewStats") or {}
+        context["ti"].xcom_push(key="review_total", value=rv.get("total"))
+        context["ti"].xcom_push(key="review_success", value=rv.get("success"))
+        context["ti"].xcom_push(key="review_fail", value=rv.get("fail"))
+        context["ti"].xcom_push(key="review_rate", value=rv.get("rate"))
+
     return row_count
 
 
@@ -156,6 +168,18 @@ def _send_slack_notification(**context):
     run_id = os.path.basename(source_dir) if source_dir else "unknown"
     execution_date = context["execution_date"].strftime("%Y-%m-%d %H:%M KST")
 
+    review_total = ti.xcom_pull(task_ids="load_to_bigquery", key="review_total") or 0
+    review_success = ti.xcom_pull(task_ids="load_to_bigquery", key="review_success") or 0
+    review_fail = ti.xcom_pull(task_ids="load_to_bigquery", key="review_fail") or 0
+    review_rate = ti.xcom_pull(task_ids="load_to_bigquery", key="review_rate") or 0.0
+
+    if review_fail == 0:
+        review_status = f"✅ {review_success:,}/{review_total:,} ({review_rate}%)"
+    elif review_rate >= 99.0:
+        review_status = f"🟡 {review_success:,}/{review_total:,} ({review_rate}%) — {review_fail}건 누락"
+    else:
+        review_status = f"🔴 {review_success:,}/{review_total:,} ({review_rate}%) — {review_fail}건 실패"
+
     blocks = [
         {
             "type": "header",
@@ -171,6 +195,12 @@ def _send_slack_notification(**context):
                 {"type": "mrkdwn", "text": f"*Run ID*\n`{run_id}`"},
                 {"type": "mrkdwn", "text": f"*적재 건수*\n{loaded_rows:,}건"},
                 {"type": "mrkdwn", "text": f"*카테고리*\n{CATEGORY_LIMIT}개"},
+            ],
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*리뷰 통계 수집*\n{review_status}"},
             ],
         },
         {

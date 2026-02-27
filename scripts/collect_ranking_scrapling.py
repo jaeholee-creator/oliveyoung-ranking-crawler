@@ -243,7 +243,34 @@ def fetch_review_stats_http(goods_nos: list[str], batch_size: int = 100) -> dict
             cooldown = random.uniform(3.0, 5.0)
             time.sleep(cooldown)
 
-    print(f"[INFO] 리뷰 API 최종: {len(results)}/{total} 성공 ({fails}건 실패)")
+    # 실패 건 재시도 (1회)
+    failed_nos = [gno for gno in goods_nos if gno not in results]
+    if failed_nos:
+        print(f"[INFO] 리뷰 재시도: {len(failed_nos)}건 → 5초 후 시작")
+        time.sleep(5.0)
+        retry_browser = "safari"
+        retry_session = cffi_requests.Session(impersonate=retry_browser)
+        retry_ok = 0
+        for gno in failed_nos:
+            url = f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{gno}/stats"
+            try:
+                resp = retry_session.get(url, timeout=10)
+                data = resp.json()
+                if data.get("status") == "SUCCESS":
+                    d = data["data"]
+                    results[gno] = {
+                        "review_count": d.get("reviewCount"),
+                        "rating": d.get("ratingDistribution", {}).get("averageRating"),
+                    }
+                    retry_ok += 1
+                    fails -= 1
+            except Exception:
+                pass
+            time.sleep(random.uniform(0.05, 0.15))
+        retry_session.close()
+        print(f"[INFO] 재시도 결과: {retry_ok}/{len(failed_nos)} 추가 성공")
+
+    print(f"[INFO] 리뷰 API 최종: {len(results)}/{total} 성공 ({total - len(results)}건 실패)")
     return results
 
 
@@ -493,8 +520,11 @@ def run() -> None:
     unique_goods_nos = list({r["goods_no"] for r in rows if r.get("goods_no")})
     print(f"[INFO] 리뷰 통계 조회: {len(unique_goods_nos)}개 상품")
 
+    review_total = len(unique_goods_nos)
     review_stats = fetch_review_stats_http(unique_goods_nos)
-    print(f"[INFO] 리뷰 통계 수집 완료: {len(review_stats)}개")
+    review_success = len(review_stats)
+    review_fail = review_total - review_success
+    print(f"[INFO] 리뷰 통계 수집 완료: {review_success}/{review_total}개 (실패 {review_fail}건)")
 
     # rows에 리뷰 데이터 병합
     for row in rows:
@@ -503,7 +533,13 @@ def run() -> None:
         row["review_count"] = stats.get("review_count")
         row["rating"] = stats.get("rating")
 
-    _write_output(out_dir, rows, category_summaries, args, run_id)
+    review_summary = {
+        "total": review_total,
+        "success": review_success,
+        "fail": review_fail,
+        "rate": round(review_success / review_total * 100, 1) if review_total else 0,
+    }
+    _write_output(out_dir, rows, category_summaries, args, run_id, review_summary)
 
     # 최소 건수 검증 → 미달 시 exit 1
     if len(rows) < args.min_rows:
@@ -519,6 +555,7 @@ def _write_output(
     category_summaries: list[dict],
     args: argparse.Namespace,
     run_id: str,
+    review_summary: dict | None = None,
 ) -> None:
     """파일 출력 (성공/실패 모두 기록)."""
     csv_headers = [
@@ -547,6 +584,7 @@ def _write_output(
         "categoriesRequested": args.category_limit,
         "categoriesCaptured": len(category_summaries),
         "rows": len(rows),
+        "reviewStats": review_summary,
         "categorySummaries": category_summaries,
         "files": {"csvPath": csv_path, "jsonPath": json_path},
     }
