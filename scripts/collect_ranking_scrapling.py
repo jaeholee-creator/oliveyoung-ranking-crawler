@@ -5,7 +5,7 @@ CF 우회 안정화:
 - camoufox: Firefox 기반 anti-detect 브라우저 (BrowserForge 핑거프린트)
 - persistent_context + geoip + humanize
 - CF 챌린지 감지 시 대기 후 재시도 (최대 3회)
-- 리뷰 통계 API 배치 호출 (브라우저 세션 내 fetch)
+- 리뷰 통계 API: curl_cffi HTTP 클라이언트 (TLS 핑거프린트 위장)
 
 Fallback: camoufox 미설치 시 patchright 사용
 
@@ -187,33 +187,72 @@ def build_detail_url(href: str) -> str | None:
     return urljoin("https://www.oliveyoung.co.kr", href)
 
 
-def fetch_review_stats(context: Any, goods_nos: list[str]) -> dict[str, dict]:
-    """별도 페이지에서 리뷰 통계 API URL을 순차 방문하여 JSON 파싱.
+def fetch_review_stats_http(goods_nos: list[str]) -> dict[str, dict]:
+    """curl_cffi로 리뷰 API 호출 (브라우저 TLS 핑거프린트 위장).
 
-    동일 브라우저 context이므로 CF 쿠키 자동 공유.
+    page.goto()로 JSON API를 방문하면 CF가 봇으로 인식하여 ~300건 후 차단.
+    curl_cffi + impersonate="chrome"는 TLS/HTTP2 핑거프린트를 위장하여 CF 통과.
     """
+    from curl_cffi import requests as cffi_requests
+
+    session = cffi_requests.Session(impersonate="chrome")
     total = len(goods_nos)
     results: dict[str, dict] = {}
     fails = 0
-    review_page = context.new_page()
-    try:
-        for i, gno in enumerate(goods_nos):
-            url = f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{gno}/stats"
-            try:
-                review_page.goto(url, wait_until="domcontentloaded", timeout=8000)
-                body = review_page.locator("body").inner_text(timeout=3000)
-                data = json.loads(body)
-                rc = data.get("data", {}).get("reviewCount")
-                avg = data.get("data", {}).get("ratingDistribution", {}).get("averageRating")
-                if rc is not None or avg is not None:
-                    results[gno] = {"review_count": rc, "rating": avg}
-            except Exception:
+    consecutive_fails = 0
+
+    def _fetch_one(gno: str) -> bool:
+        """단일 상품 리뷰 통계 조회. 성공 시 True."""
+        nonlocal fails, consecutive_fails
+        url = f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{gno}/stats"
+        try:
+            resp = session.get(url, timeout=10)
+            data = resp.json()
+            if data.get("status") == "SUCCESS":
+                d = data["data"]
+                results[gno] = {
+                    "review_count": d.get("reviewCount"),
+                    "rating": d.get("ratingDistribution", {}).get("averageRating"),
+                }
+                consecutive_fails = 0
+                return True
+            else:
                 fails += 1
-            # 진행 로그 (100건마다 + 마지막)
-            if (i + 1) % 100 == 0 or i + 1 == total:
-                print(f"[INFO] 리뷰 API 진행: {i + 1}/{total} (성공 {len(results)}, 실패 {fails})")
-    finally:
-        review_page.close()
+                consecutive_fails += 1
+                return False
+        except Exception:
+            fails += 1
+            consecutive_fails += 1
+            return False
+
+    # Fail-fast: 첫 5건 테스트
+    test_size = min(5, total)
+    test_fails = 0
+    for gno in goods_nos[:test_size]:
+        if not _fetch_one(gno):
+            test_fails += 1
+
+    if test_fails >= 3:
+        print(f"[ERROR] 리뷰 API 테스트 실패 ({test_fails}/{test_size}). 수집 중단.")
+        return results
+
+    print(f"[INFO] 리뷰 API 테스트 통과 ({test_size - test_fails}/{test_size})")
+
+    # 나머지 처리
+    for i, gno in enumerate(goods_nos[test_size:]):
+        _fetch_one(gno)
+
+        # 연속 10건 실패 시 CF 차단으로 간주하고 중단
+        if consecutive_fails >= 10:
+            print(f"[WARN] 연속 {consecutive_fails}건 실패, CF 차단 추정. 수집 중단.")
+            break
+
+        # 진행 로그 (100건마다 + 마지막)
+        done = i + test_size + 1
+        if done % 100 == 0 or done == total:
+            print(f"[INFO] 리뷰 API: {done}/{total} (성공 {len(results)}, 실패 {fails})")
+
+    print(f"[INFO] 리뷰 API 최종: {len(results)}/{total} 성공 ({fails}건 실패)")
     return results
 
 
@@ -457,21 +496,21 @@ def run() -> None:
             if idx < len(target_categories) - 1:
                 time.sleep(random.uniform(0.5, 1.5))
 
-        # 리뷰 통계 API 배치 호출 (브라우저 세션 종료 전)
-        unique_goods_nos = list({r["goods_no"] for r in rows if r.get("goods_no")})
-        print(f"[INFO] 리뷰 통계 조회: {len(unique_goods_nos)}개 상품")
-
-        review_stats = fetch_review_stats(context, unique_goods_nos)
-        print(f"[INFO] 리뷰 통계 수집 완료: {len(review_stats)}개")
-
-        # rows에 리뷰 데이터 병합
-        for row in rows:
-            gno = row.get("goods_no")
-            stats = review_stats.get(gno, {})
-            row["review_count"] = stats.get("review_count")
-            row["rating"] = stats.get("rating")
-
         page.close()
+
+    # 리뷰 통계 API 호출 (curl_cffi HTTP, 브라우저 세션 불필요)
+    unique_goods_nos = list({r["goods_no"] for r in rows if r.get("goods_no")})
+    print(f"[INFO] 리뷰 통계 조회: {len(unique_goods_nos)}개 상품")
+
+    review_stats = fetch_review_stats_http(unique_goods_nos)
+    print(f"[INFO] 리뷰 통계 수집 완료: {len(review_stats)}개")
+
+    # rows에 리뷰 데이터 병합
+    for row in rows:
+        gno = row.get("goods_no")
+        stats = review_stats.get(gno, {})
+        row["review_count"] = stats.get("review_count")
+        row["rating"] = stats.get("rating")
 
     _write_output(out_dir, rows, category_summaries, args, run_id)
 
