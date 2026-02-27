@@ -2,7 +2,7 @@
 올리브영 판매 랭킹 수집 DAG
 
 - 스케줄: 매시 30분
-- 파이프라인: 크롤링(patchright) → BigQuery 적재(Python) → 정리 → Slack 알림
+- 파이프라인: 크롤링(camoufox) → BigQuery 적재(Python) → 정리 → Slack 알림
 - 0건 수집 시 실패 처리 (crawl_ranking exit 1 → Airflow retry)
 """
 
@@ -56,11 +56,12 @@ dag = DAG(
 )
 
 
-# Task 1: patchright로 랭킹 크롤링 (DISPLAY=:99 + headless=False)
+# Task 1: camoufox로 랭킹 크롤링 + 리뷰 통계 수집
 crawl_ranking = BashOperator(
     task_id="crawl_ranking",
     bash_command=(
         f"export DISPLAY=:99 && "
+        f"export PYTHONUNBUFFERED=1 && "
         f"cd {PROJECT_DIR} && "
         f"{PYTHON_BIN} scripts/collect_ranking_scrapling.py "
         f'--url "{TARGET_URL}" '
@@ -69,7 +70,7 @@ crawl_ranking = BashOperator(
         f"--min-rows {MIN_ROWS} "
         f"--out-dir output/ranking_playwright"
     ),
-    execution_timeout=timedelta(minutes=10),
+    execution_timeout=timedelta(minutes=20),
     dag=dag,
 )
 
