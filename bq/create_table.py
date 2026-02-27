@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """BigQuery 테이블 생성 스크립트 - 올리브영 랭킹 데이터용"""
 
+import argparse
 import os
 from google.cloud import bigquery
 
@@ -43,6 +44,10 @@ def get_schema():
                              description="할인율 (%)"),
         bigquery.SchemaField("ranking_tags", "STRING", mode="NULLABLE",
                              description="랭킹 태그 (쉼표 구분: 세일,쿠폰,증정,오늘드림 등)"),
+        bigquery.SchemaField("review_count", "INT64", mode="NULLABLE",
+                             description="리뷰 수"),
+        bigquery.SchemaField("rating", "FLOAT64", mode="NULLABLE",
+                             description="평균 평점 (1~5)"),
     ]
 
 
@@ -94,5 +99,27 @@ def create_table():
         print(f"  {field.name:25s} {field.field_type:10s} {field.mode:10s} | {field.description}")
 
 
+def migrate_schema():
+    """기존 테이블에 새 컬럼 추가 (비파괴적)."""
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = SERVICE_ACCOUNT_KEY
+    client = bigquery.Client(project=PROJECT_ID)
+    table = client.get_table(FULL_TABLE_ID)
+    existing_names = {f.name for f in table.schema}
+    new_fields = [f for f in get_schema() if f.name not in existing_names]
+    if new_fields:
+        table.schema = list(table.schema) + new_fields
+        client.update_table(table, ["schema"])
+        print(f"스키마 업데이트: {[f.name for f in new_fields]} 추가됨")
+    else:
+        print("스키마 변경 없음")
+
+
 if __name__ == "__main__":
-    create_table()
+    parser = argparse.ArgumentParser(description="올리브영 랭킹 BigQuery 테이블 관리")
+    parser.add_argument("--migrate", action="store_true", help="기존 테이블에 새 컬럼 추가")
+    args = parser.parse_args()
+
+    if args.migrate:
+        migrate_schema()
+    else:
+        create_table()

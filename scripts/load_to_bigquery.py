@@ -43,6 +43,8 @@ def load_to_bigquery(json_path: str) -> int:
             "discount_price": r["discount_price"],
             "discount_rate": r["discount_rate"],
             "ranking_tags": r["ranking_tags"],
+            "review_count": r.get("review_count"),
+            "rating": r.get("rating"),
         }
         for r in rows
     ]

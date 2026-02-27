@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""올리브영 랭킹 크롤러 - patchright (patched playwright) 기반.
+"""올리브영 랭킹 크롤러 - camoufox (Firefox + BrowserForge) 기반.
 
 CF 우회 안정화:
-- headless=False + Xvfb (서버) / headed (로컬)
-- launch_persistent_context + channel="chrome"
+- camoufox: Firefox 기반 anti-detect 브라우저 (BrowserForge 핑거프린트)
+- persistent_context + geoip + humanize
 - CF 챌린지 감지 시 대기 후 재시도 (최대 3회)
-- 마우스 움직임/랜덤 딜레이로 human-like behavior
+- 리뷰 통계 API 배치 호출 (브라우저 세션 내 fetch)
+
+Fallback: camoufox 미설치 시 patchright 사용
 
 Usage:
     python collect_ranking_scrapling.py [options]
@@ -28,9 +30,20 @@ from urllib.parse import urljoin
 MAX_CF_RETRIES = 3
 CF_WAIT_SECONDS = 15
 
+# 브라우저 엔진 선택
+try:
+    from camoufox.sync_api import Camoufox
+    USE_CAMOUFOX = True
+except ImportError:
+    USE_CAMOUFOX = False
+    try:
+        from patchright.sync_api import sync_playwright
+    except ImportError:
+        pass
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="올리브영 랭킹 크롤러 (patchright)")
+    parser = argparse.ArgumentParser(description="올리브영 랭킹 크롤러 (camoufox/patchright)")
     parser.add_argument("--url", default="https://www.oliveyoung.co.kr/store/main/getBestList.do")
     parser.add_argument("--out-dir", default="output/ranking_scrapling")
     parser.add_argument("--category-limit", type=int, default=20)
@@ -174,21 +187,104 @@ def build_detail_url(href: str) -> str | None:
     return urljoin("https://www.oliveyoung.co.kr", href)
 
 
+def fetch_review_stats(context: Any, goods_nos: list[str]) -> dict[str, dict]:
+    """별도 페이지에서 리뷰 통계 API URL을 순차 방문하여 JSON 파싱.
+
+    동일 브라우저 context이므로 CF 쿠키 자동 공유.
+    건당 300ms 딜레이로 서버 부하 방지.
+    """
+    results: dict[str, dict] = {}
+    review_page = context.new_page()
+    try:
+        for i, gno in enumerate(goods_nos):
+            url = f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{gno}/stats"
+            try:
+                review_page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                body = review_page.locator("body").inner_text(timeout=5000)
+                data = json.loads(body)
+                rc = data.get("data", {}).get("reviewCount")
+                avg = data.get("data", {}).get("ratingDistribution", {}).get("averageRating")
+                if rc is not None or avg is not None:
+                    results[gno] = {"review_count": rc, "rating": avg}
+            except Exception:
+                pass  # 개별 실패는 무시
+            if i < len(goods_nos) - 1:
+                time.sleep(0.3)
+    finally:
+        review_page.close()
+    return results
+
+
+def _crawl_with_camoufox(args: argparse.Namespace, user_data_dir: Path):
+    """camoufox 브라우저 context manager를 반환."""
+    import platform
+    if args.headed:
+        headless_mode = False
+    elif platform.system() == "Linux":
+        headless_mode = "virtual"  # Xvfb 자동 관리 (Linux 서버)
+    else:
+        headless_mode = True  # macOS/Windows: 네이티브 headless
+    return Camoufox(
+        persistent_context=True,
+        headless=headless_mode,
+        user_data_dir=str(user_data_dir),
+        locale="ko-KR",
+        humanize=True,
+        enable_cache=True,
+    )
+
+
+def _crawl_with_patchright(args: argparse.Namespace, user_data_dir: Path):
+    """patchright 폴백용 context manager 래퍼."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        from patchright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            import platform
+            launch_kwargs = {
+                "user_data_dir": str(user_data_dir),
+                "headless": False,
+                "no_viewport": True,
+                "locale": "ko-KR",
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1920,1080",
+                ],
+            }
+            if platform.machine() not in ("aarch64", "arm64"):
+                launch_kwargs["channel"] = "chrome"
+            context = pw.chromium.launch_persistent_context(**launch_kwargs)
+            try:
+                yield context
+            finally:
+                context.close()
+
+    return _ctx()
+
+
 def run() -> None:
     args = parse_args()
 
-    try:
-        from patchright.sync_api import sync_playwright
-    except ImportError:
-        print("ERROR: patchright 미설치. pip install patchright", file=sys.stderr)
-        sys.exit(1)
+    if not USE_CAMOUFOX:
+        try:
+            from patchright.sync_api import sync_playwright  # noqa: F401
+            print("[INFO] camoufox 미설치, patchright 폴백 사용")
+        except ImportError:
+            print("ERROR: camoufox / patchright 모두 미설치.", file=sys.stderr)
+            print("  pip install camoufox  또는  pip install patchright", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("[INFO] 브라우저 엔진: camoufox (Firefox + BrowserForge)")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "Z"
     out_dir = Path(os.getcwd()) / args.out_dir / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # persistent context용 user_data_dir
-    user_data_dir = Path(os.getcwd()) / ".browser_profile"
+    # persistent context용 user_data_dir (브라우저 엔진별 분리)
+    profile_name = ".browser_profile_camoufox" if USE_CAMOUFOX else ".browser_profile"
+    user_data_dir = Path(os.getcwd()) / profile_name
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] 실행 ID: {run_id}")
@@ -200,24 +296,13 @@ def run() -> None:
     rows: list[dict] = []
     category_summaries: list[dict] = []
 
-    with sync_playwright() as pw:
-        # persistent context: CF 쿠키(cf_clearance) 유지
-        # channel="chrome"은 ARM64 Linux에서 미지원, Chromium 사용
-        launch_kwargs = {
-            "user_data_dir": str(user_data_dir),
-            "headless": False,  # Xvfb 환경에서 headed 모드 사용
-            "no_viewport": True,
-            "locale": "ko-KR",
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1920,1080",
-            ],
-        }
-        # x86 환경에서만 channel="chrome" 사용
-        import platform
-        if platform.machine() not in ("aarch64", "arm64"):
-            launch_kwargs["channel"] = "chrome"
-        context = pw.chromium.launch_persistent_context(**launch_kwargs)
+    # 브라우저 엔진 선택
+    if USE_CAMOUFOX:
+        browser_ctx = _crawl_with_camoufox(args, user_data_dir)
+    else:
+        browser_ctx = _crawl_with_patchright(args, user_data_dir)
+
+    with browser_ctx as context:
         page = context.new_page()
 
         # 초기 페이지 로드 + CF 챌린지 대기/재시도
@@ -358,8 +443,21 @@ def run() -> None:
             if idx < len(target_categories) - 1:
                 time.sleep(random.uniform(0.5, 1.5))
 
+        # 리뷰 통계 API 배치 호출 (브라우저 세션 종료 전)
+        unique_goods_nos = list({r["goods_no"] for r in rows if r.get("goods_no")})
+        print(f"[INFO] 리뷰 통계 조회: {len(unique_goods_nos)}개 상품")
+
+        review_stats = fetch_review_stats(context, unique_goods_nos)
+        print(f"[INFO] 리뷰 통계 수집 완료: {len(review_stats)}개")
+
+        # rows에 리뷰 데이터 병합
+        for row in rows:
+            gno = row.get("goods_no")
+            stats = review_stats.get(gno, {})
+            row["review_count"] = stats.get("review_count")
+            row["rating"] = stats.get("rating")
+
         page.close()
-        context.close()
 
     _write_output(out_dir, rows, category_summaries, args, run_id)
 
@@ -384,6 +482,7 @@ def _write_output(
         "goods_no", "detail_disp_cat_no", "detail_url", "brand_name",
         "product_name", "original_price", "discount_price", "discount_rate",
         "ranking_tags",
+        "review_count", "rating",
     ]
 
     csv_path = str(out_dir / "ranking_rows.csv")
