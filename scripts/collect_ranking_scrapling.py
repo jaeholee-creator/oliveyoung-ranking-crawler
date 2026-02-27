@@ -192,14 +192,27 @@ def fetch_review_stats_http(goods_nos: list[str]) -> dict[str, dict]:
 
     page.goto()로 JSON API를 방문하면 CF가 봇으로 인식하여 ~300건 후 차단.
     curl_cffi + impersonate="chrome"는 TLS/HTTP2 핑거프린트를 위장하여 CF 통과.
+
+    Rate limit 대응:
+    - 요청 간 50~150ms 랜덤 딜레이 (인간적 패턴)
+    - 연속 실패 감지 시 세션 재생성 + 쿨다운 대기 후 재시도
+    - 최대 3회 세션 재생성 후에도 실패 시 중단
     """
     from curl_cffi import requests as cffi_requests
 
-    session = cffi_requests.Session(impersonate="chrome")
+    IMPERSONATE_LIST = ["chrome", "chrome110", "chrome116", "chrome120", "safari"]
+
+    def _new_session(idx: int = 0) -> cffi_requests.Session:
+        browser = IMPERSONATE_LIST[idx % len(IMPERSONATE_LIST)]
+        return cffi_requests.Session(impersonate=browser)
+
+    session = _new_session(0)
     total = len(goods_nos)
     results: dict[str, dict] = {}
     fails = 0
     consecutive_fails = 0
+    session_resets = 0
+    max_session_resets = 3
 
     def _fetch_one(gno: str) -> bool:
         """단일 상품 리뷰 통계 조회. 성공 시 True."""
@@ -231,6 +244,7 @@ def fetch_review_stats_http(goods_nos: list[str]) -> dict[str, dict]:
     for gno in goods_nos[:test_size]:
         if not _fetch_one(gno):
             test_fails += 1
+        time.sleep(random.uniform(0.05, 0.15))
 
     if test_fails >= 3:
         print(f"[ERROR] 리뷰 API 테스트 실패 ({test_fails}/{test_size}). 수집 중단.")
@@ -242,17 +256,28 @@ def fetch_review_stats_http(goods_nos: list[str]) -> dict[str, dict]:
     for i, gno in enumerate(goods_nos[test_size:]):
         _fetch_one(gno)
 
-        # 연속 10건 실패 시 CF 차단으로 간주하고 중단
-        if consecutive_fails >= 10:
-            print(f"[WARN] 연속 {consecutive_fails}건 실패, CF 차단 추정. 수집 중단.")
-            break
+        # 연속 5건 실패 → 세션 재생성 + 쿨다운
+        if consecutive_fails >= 5:
+            session_resets += 1
+            if session_resets > max_session_resets:
+                print(f"[WARN] 세션 재생성 {max_session_resets}회 초과, 수집 중단.")
+                break
+            cooldown = 10 * session_resets  # 10초, 20초, 30초
+            print(f"[WARN] 연속 {consecutive_fails}건 실패, 세션 재생성 ({session_resets}/{max_session_resets}), {cooldown}초 쿨다운...")
+            session.close()
+            time.sleep(cooldown)
+            session = _new_session(session_resets)
+            consecutive_fails = 0
 
-        # 진행 로그 (100건마다 + 마지막)
+        # 요청 간 랜덤 딜레이 (50~150ms)
+        time.sleep(random.uniform(0.05, 0.15))
+
+        # 진행 로그 (200건마다 + 마지막)
         done = i + test_size + 1
-        if done % 100 == 0 or done == total:
+        if done % 200 == 0 or done == total:
             print(f"[INFO] 리뷰 API: {done}/{total} (성공 {len(results)}, 실패 {fails})")
 
-    print(f"[INFO] 리뷰 API 최종: {len(results)}/{total} 성공 ({fails}건 실패)")
+    print(f"[INFO] 리뷰 API 최종: {len(results)}/{total} 성공 ({fails}건 실패, 세션리셋 {session_resets}회)")
     return results
 
 
