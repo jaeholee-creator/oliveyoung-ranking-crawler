@@ -408,28 +408,63 @@ def run() -> None:
             _write_output(out_dir, rows, category_summaries, args, run_id)
             sys.exit(1)
 
+        consecutive_fails = 0
         for idx, category in enumerate(target_categories):
             cat_label = f"[{idx + 1}/{len(target_categories)}] {category['name']} ({category['code']})"
             print(f"[INFO] 카테고리 처리 중: {cat_label}")
 
             button_code = category.get("rawCode", "")
-            locator = page.locator(f'button[data-ref-dispcatno="{button_code}"]').first
-            try:
-                locator.wait_for(timeout=15000)
-            except Exception:
-                print(f"[WARN] 카테고리 버튼 대기 실패, 스킵: {cat_label}")
-                continue
 
-            # 클릭 전 스크롤 + 랜덤 딜레이
-            try:
-                locator.scroll_into_view_if_needed(timeout=5000)
-            except Exception:
-                pass
-            time.sleep(random.uniform(0.3, 0.8))
-            try:
-                locator.click(timeout=15000)
-            except Exception:
-                print(f"[WARN] 카테고리 클릭 실패, 스킵: {cat_label}")
+            # 연속 2회 이상 실패 시 선제적 페이지 재로드
+            if consecutive_fails >= 2:
+                print(f"[WARN] {consecutive_fails}회 연속 실패 감지 → 페이지 재로드 후 재시도")
+                page.goto(args.url, wait_until="domcontentloaded", timeout=120000)
+                time.sleep(random.uniform(3.0, 5.0))
+                consecutive_fails = 0
+
+            # 버튼 대기 + 클릭 (실패 시 1회 재시도)
+            clicked = False
+            for attempt in range(2):
+                locator = page.locator(f'button[data-ref-dispcatno="{button_code}"]').first
+                try:
+                    locator.wait_for(timeout=15000)
+                except Exception:
+                    if attempt == 0:
+                        print(f"[WARN] 카테고리 버튼 대기 실패, 2초 후 재시도: {cat_label}")
+                        time.sleep(2.0)
+                        continue
+                    print(f"[WARN] 카테고리 버튼 대기 최종 실패, 스킵: {cat_label}")
+                    break
+
+                # 클릭 전 스크롤 + 랜덤 딜레이
+                try:
+                    locator.scroll_into_view_if_needed(timeout=5000)
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.3, 0.8))
+
+                try:
+                    locator.click(timeout=15000)
+                    clicked = True
+                    break
+                except Exception:
+                    if attempt == 0:
+                        print(f"[WARN] 카테고리 클릭 실패, 2초 후 재시도: {cat_label}")
+                        time.sleep(2.0)
+                    else:
+                        print(f"[WARN] 카테고리 클릭 최종 실패, 스킵: {cat_label}")
+
+            if not clicked:
+                consecutive_fails += 1
+                category_summaries.append({
+                    "categoryCode": category["code"],
+                    "categoryName": category["name"],
+                    "challengeDetected": False,
+                    "goodsCount": 0,
+                    "rankMin": None,
+                    "rankMax": None,
+                    "urlAfterClick": None,
+                })
                 continue
 
             # 카테고리 전환 대기 (랜덤화)
@@ -509,6 +544,7 @@ def run() -> None:
                 "urlAfterClick": page.url,
             })
             print(f"[INFO] 카테고리 완료: {cat_label} → {len(normalized)}개 상품")
+            consecutive_fails = 0 if len(normalized) > 0 else consecutive_fails + 1
 
             # 카테고리 간 랜덤 딜레이
             if idx < len(target_categories) - 1:
