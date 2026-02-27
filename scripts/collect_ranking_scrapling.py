@@ -20,6 +20,7 @@ import json
 import os
 import random
 import re
+import socket
 import sys
 import time
 import threading
@@ -32,6 +33,7 @@ from urllib.parse import parse_qs, quote_plus, urlencode, urljoin, urlsplit, url
 MAX_CF_RETRIES = 3
 CF_WAIT_SECONDS = 15
 REVIEW_API = "https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}/stats"
+ALT_REVIEW_API = "https://product-review-service.oliveyoung.com/api/v1/domestic-reviews/count"
 BROWSERS = ["chrome", "chrome120", "safari"]
 DEFAULT_CATEGORY_LIMIT = 21
 DEFAULT_MIN_ROWS = 2100
@@ -583,9 +585,16 @@ def _parse_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     status = payload.get("status")
     if status is not None:
-        status_str = str(status).strip().upper()
-        if status_str and status_str not in ("SUCCESS", "OK"):
-            return {}
+        if isinstance(status, bool):
+            if not status:
+                return {}
+        elif isinstance(status, (int, float)):
+            if int(status) != 1:
+                return {}
+        else:
+            status_str = str(status).strip().lower()
+            if status_str and status_str not in {"success", "ok", "successful", "true", "1", "s"}:
+                return {}
 
     data = payload.get("data") or payload.get("result") or payload.get("body") or {}
     if not isinstance(data, dict):
@@ -628,6 +637,53 @@ def _parse_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _parse_review_count_only(payload: Any) -> dict[str, Any] | None:
+    """리뷰 카운트만 별도 엔드포인트에서 받는 응답을 정규화."""
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        count = (
+            data.get("count")
+            or data.get("reviewCount")
+            or data.get("totalCount")
+            or data.get("reviewCountTotal")
+        )
+    else:
+        count = payload.get("count") or payload.get("reviewCount") or payload.get("totalCount")
+
+    if count is None:
+        return None
+    count = to_int(count)
+    if count is None:
+        return None
+    return {"review_count": count}
+
+
+def _is_dns_error(exc: BaseException) -> bool:
+    message = str(exc)
+    lowered = message.lower()
+    return (
+        "name or service not known" in lowered
+        or "nameresolution" in lowered
+        or "temporary failure in name resolution" in lowered
+        or "nodename nor servname provided" in lowered
+        or "getaddrinfo failed" in lowered
+    )
+
+
+def _resolve_host(host: str) -> bool:
+    """필수 도메인 해석이 가능한지 사전 확인."""
+    try:
+        socket.gethostbyname(host)
+        return True
+    except Exception:
+        return False
+
+
 def _review_backoff(attempt: int) -> float:
     idx = min(max(attempt - 1, 0), len(REVIEW_BACKOFF_SECONDS) - 1)
     return REVIEW_BACKOFF_SECONDS[idx] + random.uniform(0.2, 0.8)
@@ -665,6 +721,7 @@ def fetch_review_stats_http(
     def _fetch_one(gno: str, worker_id: int) -> tuple[str, dict[str, Any] | None]:
         browser = _pick_browser(worker_id)
         url = REVIEW_API.format(goods_no=gno)
+        alt_url = f"{ALT_REVIEW_API}?product-id={gno}"
         headers = {
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -692,11 +749,21 @@ def fetch_review_stats_http(
                     parsed = _parse_review_payload(resp.json())
                     if parsed:
                         return gno, parsed
+                    # 메인 API에서 실패한 경우 대체 카운트 API로 보완 시도
+                    alt_resp = session.get(alt_url, headers=headers, timeout=timeout)
+                    if int(alt_resp.status_code) == 200:
+                        parsed_alt = _parse_review_count_only(alt_resp.json())
+                        if parsed_alt:
+                            return gno, parsed_alt
                 if status in (403, 429, 500, 502, 503):
                     time.sleep(_review_backoff(attempt))
                     continue
                 return gno, None
-            except Exception:
+            except Exception as exc:
+                if _is_dns_error(exc):
+                    print(f"[ERROR] DNS/네트워크 해석 실패: {gno}, {exc}")
+                    # DNS는 즉시 반환하여 전체 재시도 루프를 줄임
+                    return gno, None
                 time.sleep(_review_backoff(attempt))
 
         return gno, None
@@ -787,14 +854,16 @@ def _crawl_with_playwright(args: argparse.Namespace, user_data_dir: Path):
     def _ctx():
         with _SYNC_PLAYWRIGHT() as pw:
             import platform
+            headless_mode = not args.headed
             launch_kwargs = {
                 "user_data_dir": str(user_data_dir),
-                "headless": False,
+                "headless": headless_mode,
                 "no_viewport": True,
                 "locale": "ko-KR",
                 "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--window-size=1920,1080",
+                    "--disable-crash-reporter",
                 ],
             }
             if platform.machine() not in ("aarch64", "arm64"):
@@ -816,6 +885,12 @@ def run() -> None:
 
     if args.review_only:
         print("[INFO] review-only 모드: 카테고리 수집 없이 리뷰 API만 호출")
+        if not _resolve_host("m.oliveyoung.co.kr") or not _resolve_host("product-review-service.oliveyoung.com"):
+            print("ERROR: oliveyoung 도메인 DNS 해석 실패. 현재 실행 환경의 네트워크/프록시/DNS를 점검하세요.", file=sys.stderr)
+            print("진단 예시: nslookup m.oliveyoung.co.kr", file=sys.stderr)
+            print("  또는 requests/브라우저가 동일하게 실패하면", file=sys.stderr)
+            print("  DNS/방화벽/프록시 레벨 차단 가능성이 큽니다.", file=sys.stderr)
+            sys.exit(1)
         goods_raw = [g.strip() for g in args.review_goods.split(",") if g.strip()]
         if not goods_raw:
             print("ERROR: --review-goods가 비어 있습니다. 쉼표로 구분된 goods_no를 전달하세요.", file=sys.stderr)
@@ -909,7 +984,7 @@ def run() -> None:
         print("[INFO] 브라우저 엔진: playwright (chromium)")
 
     # persistent context용 user_data_dir (브라우저 엔진별 분리)
-    profile_name = ".browser_profile_camoufox" if USE_CAMOUFOX else ".browser_profile"
+    profile_name = ".browser_profile_camoufox" if browser_engine == "camoufox" else ".browser_profile_playwright"
     user_data_dir = Path(os.getcwd()) / profile_name
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -990,6 +1065,11 @@ def run() -> None:
                 "실제 모드에서는 최소 조건 재설정이 필요합니다."
             )
         return
+
+    if not _resolve_host("www.oliveyoung.co.kr"):
+        print("ERROR: www.oliveyoung.co.kr DNS 해석 실패. 현재 실행 환경에서 사이트 도메인 접속이 안 됩니다.", file=sys.stderr)
+        print("실행 환경 DNS/방화벽/네트워크 라우팅을 먼저 점검하세요.", file=sys.stderr)
+        sys.exit(1)
 
     # 브라우저 엔진 선택
     if browser_engine == "camoufox":
