@@ -355,11 +355,23 @@ def run() -> None:
 
             button_code = category.get("rawCode", "")
             locator = page.locator(f'button[data-ref-dispcatno="{button_code}"]').first
-            locator.wait_for(timeout=15000)
+            try:
+                locator.wait_for(timeout=15000)
+            except Exception:
+                print(f"[WARN] 카테고리 버튼 대기 실패, 스킵: {cat_label}")
+                continue
 
-            # 클릭 전 랜덤 딜레이
+            # 클릭 전 스크롤 + 랜덤 딜레이
+            try:
+                locator.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
             time.sleep(random.uniform(0.3, 0.8))
-            locator.click(timeout=15000)
+            try:
+                locator.click(timeout=15000)
+            except Exception:
+                print(f"[WARN] 카테고리 클릭 실패, 스킵: {cat_label}")
+                continue
 
             # 카테고리 전환 대기 (랜덤화)
             wait_ms = args.category_wait_ms + random.randint(-300, 500)
