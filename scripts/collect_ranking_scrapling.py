@@ -195,7 +195,7 @@ def fetch_review_stats_http(goods_nos: list[str], batch_size: int = 100) -> dict
     """
     from curl_cffi import requests as cffi_requests
 
-    BROWSERS = ["chrome", "chrome110", "chrome116", "chrome120", "safari"]
+    BROWSERS = ["chrome", "chrome120", "safari"]
     total = len(goods_nos)
     results: dict[str, dict] = {}
     fails = 0
