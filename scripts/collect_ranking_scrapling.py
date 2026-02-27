@@ -244,7 +244,7 @@ def fetch_review_stats_http(goods_nos: list[str]) -> dict[str, dict]:
     for gno in goods_nos[:test_size]:
         if not _fetch_one(gno):
             test_fails += 1
-        time.sleep(random.uniform(0.05, 0.15))
+        time.sleep(random.uniform(0.2, 0.5))
 
     if test_fails >= 3:
         print(f"[ERROR] 리뷰 API 테스트 실패 ({test_fails}/{test_size}). 수집 중단.")
@@ -270,7 +270,7 @@ def fetch_review_stats_http(goods_nos: list[str]) -> dict[str, dict]:
             consecutive_fails = 0
 
         # 요청 간 랜덤 딜레이 (50~150ms)
-        time.sleep(random.uniform(0.05, 0.15))
+        time.sleep(random.uniform(0.2, 0.5))
 
         # 진행 로그 (200건마다 + 마지막)
         done = i + test_size + 1
