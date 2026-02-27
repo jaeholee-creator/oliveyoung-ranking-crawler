@@ -1,7 +1,7 @@
 """
 올리브영 판매 랭킹 수집 DAG
 
-- 스케줄: 매시 30분
+- 스케줄: 매시 1회
 - 파이프라인: 크롤링(camoufox) → BigQuery 적재(Python) → 정리 → Slack 알림
 - 0건 수집 시 실패 처리 (crawl_ranking exit 1 → Airflow retry)
 """
@@ -15,12 +15,26 @@ import json
 import glob
 import os
 import urllib.request
-import urllib.error
 
 PROJECT_DIR = Variable.get("oliveyoung_project_dir", default_var="/opt/airflow/app")
 GCP_KEY_PATH = Variable.get("gcp_key_path", default_var="/opt/airflow/keys/target-378109-7f1aa3e0dc9a.json")
 CATEGORY_LIMIT = int(Variable.get("oliveyoung_category_limit", default_var="21"))
 CATEGORY_WAIT_MS = int(Variable.get("oliveyoung_category_wait_ms", default_var="2200"))
+CATEGORY_ROWS = int(Variable.get("oliveyoung_category_rows", default_var="100"))
+REVIEW_WORKERS = int(Variable.get("oliveyoung_review_workers", default_var="18"))
+REVIEW_RETRIES = int(Variable.get("oliveyoung_review_retries", default_var="3"))
+REVIEW_TIMEOUT = float(Variable.get("oliveyoung_review_timeout", default_var="10"))
+CATEGORY_RETRIES = int(Variable.get("oliveyoung_category_retries", default_var="2"))
+PAGE_TIMEOUT_MS = int(Variable.get("oliveyoung_page_timeout_ms", default_var="45000"))
+CATEGORY_SCROLL_ATTEMPTS = int(Variable.get("oliveyoung_category_scroll_attempts", default_var="3"))
+CRAWL_TIMEOUT_MINUTES = int(Variable.get("oliveyoung_crawl_timeout_minutes", default_var="20"))
+REVIEW_CACHE_PATH = Variable.get("oliveyoung_review_cache_path", default_var="cache/review_stats_cache.json")
+REVIEW_CACHE_TTL_HOURS = float(Variable.get("oliveyoung_review_cache_ttl_hours", default_var="8"))
+REVIEW_CACHE_MAX_ENTRIES = int(Variable.get("oliveyoung_review_cache_max_entries", default_var="30000"))
+CLEANUP_RETENTION_DAYS = int(Variable.get("oliveyoung_cleanup_days", default_var="7"))
+CRAWL_RETRIES = int(Variable.get("oliveyoung_airflow_retries", default_var="2"))
+CRAWL_RETRY_DELAY_MINUTES = int(Variable.get("oliveyoung_airflow_retry_delay", default_var="3"))
+MIN_REVIEW_RATE = float(Variable.get("oliveyoung_min_review_success_rate", default_var="80.0"))
 SLACK_BOT_TOKEN = Variable.get("slack_bot_token", default_var="")
 SLACK_CHANNEL_ID = Variable.get("slack_channel_id", default_var="C0ACH02BLG5")
 BRAND_REPORT_TARGETS = Variable.get("brand_report_targets", default_var="바이오던스").split(",")
@@ -33,22 +47,24 @@ TARGET_URL = (
 )
 
 # 최소 수집 건수 (미달 시 크롤러가 exit 1 → Airflow가 retry)
-MIN_ROWS = 100
+MIN_ROWS = 2100
 
 default_args = {
     "owner": "jaeho",
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
-    "retries": 2,
-    "retry_delay": timedelta(minutes=5),
+    "retries": CRAWL_RETRIES,
+    "retry_delay": timedelta(minutes=CRAWL_RETRY_DELAY_MINUTES),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=8),
 }
 
 dag = DAG(
     dag_id="oliveyoung_ranking_collector",
     default_args=default_args,
-    description="올리브영 판매 랭킹 수집 및 BigQuery 적재 (매시 30분)",
-    schedule_interval="30 * * * *",
+    description="올리브영 판매 랭킹 수집 및 BigQuery 적재 (매시 1회)",
+    schedule_interval="0 * * * *",
     start_date=datetime(2026, 2, 25),
     catchup=False,
     max_active_runs=1,
@@ -67,10 +83,20 @@ crawl_ranking = BashOperator(
         f'--url "{TARGET_URL}" '
         f"--category-limit {CATEGORY_LIMIT} "
         f"--category-wait-ms {CATEGORY_WAIT_MS} "
+        f"--category-rows {CATEGORY_ROWS} "
         f"--min-rows {MIN_ROWS} "
+        f"--review-workers {REVIEW_WORKERS} "
+        f"--review-retries {REVIEW_RETRIES} "
+        f"--review-timeout {REVIEW_TIMEOUT} "
+        f"--category-retries {CATEGORY_RETRIES} "
+        f"--page-timeout-ms {PAGE_TIMEOUT_MS} "
+        f"--category-scroll-attempts {CATEGORY_SCROLL_ATTEMPTS} "
+        f"--review-cache-path {REVIEW_CACHE_PATH} "
+        f"--review-cache-ttl-hours {REVIEW_CACHE_TTL_HOURS} "
+        f"--review-cache-max-entries {REVIEW_CACHE_MAX_ENTRIES} "
         f"--out-dir output/ranking_playwright"
     ),
-    execution_timeout=timedelta(minutes=20),
+    execution_timeout=timedelta(minutes=CRAWL_TIMEOUT_MINUTES),
     dag=dag,
 )
 
@@ -100,22 +126,52 @@ def _load_latest_to_bigquery(**context):
     if not rows:
         raise ValueError(f"수집 데이터 0건 — BQ 적재 스킵: {json_path}")
 
+    summary_path = os.path.join(latest_dir, "summary.json")
+    summary: dict[str, object] = {}
+    if os.path.exists(summary_path):
+        with open(summary_path) as f:
+            summary = json.load(f)
+
+    summary_rows = summary.get("rows")
+    try:
+        if summary_rows is not None and int(summary_rows) < MIN_ROWS:
+            raise ValueError(f"수집 요약건수({summary_rows}) 미달 — 재수집 대상: {latest_dir}")
+    except (TypeError, ValueError):
+        pass
+
+    categories_requested = summary.get("categoriesRequested")
+    categories_captured = summary.get("categoriesCaptured")
+    if categories_requested and categories_captured is not None:
+        try:
+            if int(categories_captured) < int(categories_requested):
+                print(f"[WARN] 카테고리 수집 부족: {categories_captured}/{categories_requested}")
+        except (TypeError, ValueError):
+            pass
+
     from load_to_bigquery import load_to_bigquery
     row_count = load_to_bigquery(json_path)
 
     context["ti"].xcom_push(key="loaded_rows", value=row_count)
     context["ti"].xcom_push(key="source_dir", value=latest_dir)
+    if categories_captured is not None:
+        try:
+            context["ti"].xcom_push(key="categories_captured", value=int(categories_captured))
+        except (TypeError, ValueError):
+            context["ti"].xcom_push(key="categories_captured", value=categories_captured)
 
     # 리뷰 통계 xcom push
-    summary_path = os.path.join(latest_dir, "summary.json")
-    if os.path.exists(summary_path):
-        with open(summary_path) as f:
-            summary = json.load(f)
-        rv = summary.get("reviewStats") or {}
-        context["ti"].xcom_push(key="review_total", value=rv.get("total"))
-        context["ti"].xcom_push(key="review_success", value=rv.get("success"))
-        context["ti"].xcom_push(key="review_fail", value=rv.get("fail"))
-        context["ti"].xcom_push(key="review_rate", value=rv.get("rate"))
+    rv = summary.get("reviewStats") or {}
+    context["ti"].xcom_push(key="review_total", value=rv.get("total"))
+    context["ti"].xcom_push(key="review_success", value=rv.get("success"))
+    context["ti"].xcom_push(key="review_fail", value=rv.get("fail"))
+    context["ti"].xcom_push(key="review_rate", value=rv.get("rate"))
+
+    review_rate = 0.0
+    try:
+        review_rate = float(rv.get("rate") or 0.0)
+    except (TypeError, ValueError):
+        review_rate = 0.0
+    context["ti"].xcom_push(key="review_alert", value=review_rate < MIN_REVIEW_RATE)
 
     return row_count
 
@@ -129,9 +185,9 @@ load_to_bq = PythonOperator(
 
 
 def _cleanup_old_runs(**context):
-    """7일 이상 된 로컬 수집 데이터 정리"""
+    """보관 기간 경과된 로컬 수집 데이터 정리"""
     output_base = os.path.join(PROJECT_DIR, "output", "ranking_playwright")
-    cutoff = datetime.utcnow() - timedelta(days=7)
+    cutoff = datetime.utcnow() - timedelta(days=CLEANUP_RETENTION_DAYS)
 
     removed = 0
     for run_dir in glob.glob(os.path.join(output_base, "*Z")):
@@ -167,11 +223,13 @@ def _send_slack_notification(**context):
     source_dir = ti.xcom_pull(task_ids="load_to_bigquery", key="source_dir") or ""
     run_id = os.path.basename(source_dir) if source_dir else "unknown"
     execution_date = context["execution_date"].strftime("%Y-%m-%d %H:%M KST")
+    categories_captured = ti.xcom_pull(task_ids="load_to_bigquery", key="categories_captured") or CATEGORY_LIMIT
 
     review_total = ti.xcom_pull(task_ids="load_to_bigquery", key="review_total") or 0
     review_success = ti.xcom_pull(task_ids="load_to_bigquery", key="review_success") or 0
     review_fail = ti.xcom_pull(task_ids="load_to_bigquery", key="review_fail") or 0
     review_rate = ti.xcom_pull(task_ids="load_to_bigquery", key="review_rate") or 0.0
+    review_alert = ti.xcom_pull(task_ids="load_to_bigquery", key="review_alert") or False
 
     if review_fail == 0:
         review_status = f"✅ {review_success:,}/{review_total:,} ({review_rate}%)"
@@ -195,6 +253,7 @@ def _send_slack_notification(**context):
                 {"type": "mrkdwn", "text": f"*Run ID*\n`{run_id}`"},
                 {"type": "mrkdwn", "text": f"*적재 건수*\n{loaded_rows:,}건"},
                 {"type": "mrkdwn", "text": f"*카테고리*\n{CATEGORY_LIMIT}개"},
+                {"type": "mrkdwn", "text": f"*적재 카테고리*\n{categories_captured}개"},
             ],
         },
         {
@@ -215,7 +274,7 @@ def _send_slack_notification(**context):
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": "📊 Airflow DAG: `oliveyoung_ranking_collector` | 매시 30분 자동 수집",
+                    "text": "📊 Airflow DAG: `oliveyoung_ranking_collector` | 매시 1회 자동 수집",
                 }
             ],
         },
@@ -240,6 +299,8 @@ def _send_slack_notification(**context):
     result = json.loads(resp.read())
     if not result.get("ok"):
         raise RuntimeError(f"Slack 발송 실패: {result.get('error')}")
+    if review_alert:
+        print(f"[WARN] 리뷰 성공률 저조: {review_rate}% (임계값 {MIN_REVIEW_RATE}%)")
     print(f"Slack 알림 발송 완료: channel={SLACK_CHANNEL_ID}")
 
 
@@ -273,13 +334,16 @@ def _send_brand_ranking_report(**context):
         if not brand:
             continue
         print(f"[{brand}] 랭킹 변동 리포트 조회 중...")
-        data = fetch_ranking_comparison(client, brand)
-        if not data:
-            print(f"[{brand}] 데이터 없음, 스킵")
-            continue
-        blocks = build_slack_blocks(brand, data)
-        send_slack(blocks, brand, SLACK_CHANNEL_ID, SLACK_BOT_TOKEN)
-        print(f"[{brand}] 발송 완료")
+        try:
+            data = fetch_ranking_comparison(client, brand)
+            if not data:
+                print(f"[{brand}] 데이터 없음, 스킵")
+                continue
+            blocks = build_slack_blocks(brand, data)
+            send_slack(blocks, brand, SLACK_CHANNEL_ID, SLACK_BOT_TOKEN)
+            print(f"[{brand}] 발송 완료")
+        except Exception as exc:
+            print(f"[WARN] {brand} 리포트 처리 실패: {exc}")
 
 
 brand_ranking_report = PythonOperator(
