@@ -23,6 +23,7 @@ CATEGORY_LIMIT = int(Variable.get("oliveyoung_category_limit", default_var="21")
 CATEGORY_WAIT_MS = int(Variable.get("oliveyoung_category_wait_ms", default_var="2200"))
 SLACK_BOT_TOKEN = Variable.get("slack_bot_token", default_var="")
 SLACK_CHANNEL_ID = Variable.get("slack_channel_id", default_var="C0ACH02BLG5")
+BRAND_REPORT_TARGETS = Variable.get("brand_report_targets", default_var="바이오던스").split(",")
 PYTHON_BIN = Variable.get("oliveyoung_python_bin", default_var="/home/ubuntu/airflow-venv/bin/python3")
 
 TARGET_URL = (
@@ -218,5 +219,44 @@ notify_slack = PythonOperator(
     dag=dag,
 )
 
-# 파이프라인: 크롤링 → BigQuery 적재 → 정리 → Slack 알림
-crawl_ranking >> load_to_bq >> cleanup >> notify_slack
+
+def _send_brand_ranking_report(**context):
+    """브랜드별 시간별 랭킹 변동을 BigQuery에서 조회해 Slack으로 발송"""
+    if not SLACK_BOT_TOKEN:
+        print("SLACK_BOT_TOKEN이 설정되지 않아 브랜드 리포트를 스킵합니다.")
+        return
+
+    import sys
+    sys.path.insert(0, os.path.join(PROJECT_DIR, "scripts"))
+
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GCP_KEY_PATH
+    os.environ["SLACK_BOT_TOKEN"] = SLACK_BOT_TOKEN
+    os.environ["SLACK_CHANNEL_ID"] = SLACK_CHANNEL_ID
+
+    from brand_ranking_report import get_bq_client, fetch_ranking_comparison, build_slack_blocks, send_slack
+
+    client = get_bq_client()
+
+    for brand in BRAND_REPORT_TARGETS:
+        brand = brand.strip()
+        if not brand:
+            continue
+        print(f"[{brand}] 랭킹 변동 리포트 조회 중...")
+        data = fetch_ranking_comparison(client, brand)
+        if not data:
+            print(f"[{brand}] 데이터 없음, 스킵")
+            continue
+        blocks = build_slack_blocks(brand, data)
+        send_slack(blocks, brand, SLACK_CHANNEL_ID, SLACK_BOT_TOKEN)
+        print(f"[{brand}] 발송 완료")
+
+
+brand_ranking_report = PythonOperator(
+    task_id="brand_ranking_report",
+    python_callable=_send_brand_ranking_report,
+    execution_timeout=timedelta(minutes=2),
+    dag=dag,
+)
+
+# 파이프라인: 크롤링 → BigQuery 적재 → 정리 → 수집완료 알림 → 브랜드 랭킹 변동 리포트
+crawl_ranking >> load_to_bq >> cleanup >> notify_slack >> brand_ranking_report
