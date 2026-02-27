@@ -81,14 +81,25 @@ try:
     USE_CAMOUFOX = True
 except ImportError:
     USE_CAMOUFOX = False
+    _SYNC_PLAYWRIGHT = None
+
+try:
+    from patchright.sync_api import sync_playwright as _SYNC_PLAYWRIGHT
+except ImportError:
     try:
-        from patchright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright as _SYNC_PLAYWRIGHT
     except ImportError:
-        pass
+        _SYNC_PLAYWRIGHT = None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="올리브영 랭킹 크롤러 (camoufox/patchright)")
+    parser.add_argument(
+        "--browser-engine",
+        choices=["auto", "camoufox", "playwright"],
+        default="auto",
+        help="브라우저 엔진 선택 (auto: 설치 순 우선순위)",
+    )
     parser.add_argument("--url", default="https://www.oliveyoung.co.kr/store/main/getBestList.do")
     parser.add_argument("--out-dir", default="output/ranking_scrapling")
     parser.add_argument("--category-limit", type=int, default=DEFAULT_CATEGORY_LIMIT)
@@ -129,6 +140,29 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=REVIEW_CACHE_MAX_ENTRIES,
         help="캐시 최대 저장 건수",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="브라우저 실행 없이 목업 데이터로 결과만 출력",
+    )
+    parser.add_argument(
+        "--dry-run-rows",
+        type=int,
+        default=0,
+        help="dry-run 시 카테고리당 생성할 목업 행 수(0이면 생성 안함)",
+    )
+    parser.add_argument(
+        "--review-only",
+        action="store_true",
+        default=False,
+        help="카테고리 수집 없이 goods_no 기준으로 리뷰 API만 단독 테스트",
+    )
+    parser.add_argument(
+        "--review-goods",
+        default="",
+        help="review-only 모드에서 테스트할 goods_no 목록(쉼표 구분)",
     )
     return parser.parse_args()
 
@@ -544,12 +578,53 @@ def _get_review_session(cffi_requests: Any, browser: str):
 
 
 def _parse_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    if payload.get("status") != "SUCCESS":
+    if not isinstance(payload, dict):
         return {}
-    data = payload.get("data") or {}
+
+    status = payload.get("status")
+    if status is not None:
+        status_str = str(status).strip().upper()
+        if status_str and status_str not in ("SUCCESS", "OK"):
+            return {}
+
+    data = payload.get("data") or payload.get("result") or payload.get("body") or {}
+    if not isinstance(data, dict):
+        return {}
+
+    # ratingDistribution 구조가 바뀐 경우/legacy 구조 모두 대응
+    rating_distribution = data.get("ratingDistribution") or {}
+    rating = (
+        data.get("averageRating")
+        or data.get("rating")
+        or (rating_distribution.get("averageRating") if isinstance(rating_distribution, dict) else None)
+    )
+
+    # 다양한 API 스키마의 리뷰 건수 키 대응
+    review_count = (
+        data.get("reviewCount")
+        or data.get("review_count")
+        or data.get("reviewCnt")
+        or data.get("review_total_count")
+        or data.get("totalReviewCount")
+    )
+
+    if review_count is None and isinstance(rating_distribution, dict):
+        review_count = (
+            rating_distribution.get("reviewCount")
+            or rating_distribution.get("totalCount")
+            or rating_distribution.get("count")
+        )
+
+    # 여전히 값이 비어있으면 빈 응답으로 판단
+    if review_count is None and rating is None:
+        return {}
+
+    if isinstance(review_count, str):
+        review_count = to_int(review_count)
+
     return {
-        "review_count": data.get("reviewCount"),
-        "rating": (data.get("ratingDistribution") or {}).get("averageRating"),
+        "review_count": review_count,
+        "rating": rating,
     }
 
 
@@ -566,7 +641,17 @@ def fetch_review_stats_http(
     retries: int = REVIEW_RETRIES,
 ) -> dict[str, dict]:
     """curl_cffi로 리뷰 API 호출 — 병렬 + 재시도."""
-    from curl_cffi import requests as cffi_requests
+    try:
+        from curl_cffi import requests as cffi_requests
+        supports_impersonate = True
+    except ImportError:
+        import requests as cffi_requests
+        supports_impersonate = False
+
+    def _new_session(browser: str):
+        if supports_impersonate:
+            return cffi_requests.Session(impersonate=browser)
+        return cffi_requests.Session()
 
     unique_nos = list(dict.fromkeys([x for x in goods_nos if x]))
     if not unique_nos:
@@ -580,8 +665,24 @@ def fetch_review_stats_http(
     def _fetch_one(gno: str, worker_id: int) -> tuple[str, dict[str, Any] | None]:
         browser = _pick_browser(worker_id)
         url = REVIEW_API.format(goods_no=gno)
-        headers = {"Accept": "application/json, text/plain, */*"}
-        session = _get_review_session(cffi_requests, browser)
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://m.oliveyoung.co.kr/",
+            "Origin": "https://m.oliveyoung.co.kr",
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+            "sec-ch-ua": '"Chromium";v="120", "Not A;Brand";v="99", "Google Chrome";v="120"',
+            "sec-ch-ua-mobile": "?1",
+            "sec-ch-ua-platform": '"iOS"',
+        }
+        if supports_impersonate:
+            session = _get_review_session(cffi_requests, browser)
+        else:
+            session = _new_session(browser)
 
         for attempt in range(1, retries + 1):
             try:
@@ -676,14 +777,15 @@ def _crawl_with_camoufox(args: argparse.Namespace, user_data_dir: Path):
     )
 
 
-def _crawl_with_patchright(args: argparse.Namespace, user_data_dir: Path):
-    """patchright 폴백용 context manager 래퍼."""
+def _crawl_with_playwright(args: argparse.Namespace, user_data_dir: Path):
+    """playwright 폴백용 context manager 래퍼."""
     from contextlib import contextmanager
+    if _SYNC_PLAYWRIGHT is None:
+        raise RuntimeError("playwright sync API 미사용 가능 상태입니다.")
 
     @contextmanager
     def _ctx():
-        from patchright.sync_api import sync_playwright
-        with sync_playwright() as pw:
+        with _SYNC_PLAYWRIGHT() as pw:
             import platform
             launch_kwargs = {
                 "user_data_dir": str(user_data_dir),
@@ -708,21 +810,103 @@ def _crawl_with_patchright(args: argparse.Namespace, user_data_dir: Path):
 
 def run() -> None:
     args = parse_args()
-
-    if not USE_CAMOUFOX:
-        try:
-            from patchright.sync_api import sync_playwright  # noqa: F401
-            print("[INFO] camoufox 미설치, patchright 폴백 사용")
-        except ImportError:
-            print("ERROR: camoufox / patchright 모두 미설치.", file=sys.stderr)
-            print("  pip install camoufox  또는  pip install patchright", file=sys.stderr)
-            sys.exit(1)
-    else:
-        print("[INFO] 브라우저 엔진: camoufox (Firefox + BrowserForge)")
-
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "Z"
     out_dir = Path(os.getcwd()) / args.out_dir / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.review_only:
+        print("[INFO] review-only 모드: 카테고리 수집 없이 리뷰 API만 호출")
+        goods_raw = [g.strip() for g in args.review_goods.split(",") if g.strip()]
+        if not goods_raw:
+            print("ERROR: --review-goods가 비어 있습니다. 쉼표로 구분된 goods_no를 전달하세요.", file=sys.stderr)
+            print("예: --review-goods 100000001,100000002", file=sys.stderr)
+            sys.exit(1)
+
+        review_stats = fetch_review_stats_http(
+            goods_raw,
+            max_workers=args.review_workers,
+            timeout=args.review_timeout,
+            retries=args.review_retries,
+        )
+
+        rows = []
+        review_total = len(goods_raw)
+        review_success = len([v for v in review_stats.values() if v])
+        review_fail = review_total - review_success
+        review_summary = {
+            "total": review_total,
+            "cacheHit": 0,
+            "cacheHitRate": 0,
+            "success": review_success,
+            "fail": review_fail,
+            "rate": round(review_success / review_total * 100, 1) if review_total else 0,
+        }
+
+        for g in goods_raw:
+            stats = review_stats.get(g, {})
+            rows.append({
+                "collected_at_utc": now_iso(),
+                "category_code": "REVIEW",
+                "category_name": "review_only",
+                "rank": None,
+                "goods_no": g,
+                "detail_disp_cat_no": "",
+                "detail_url": f"https://m.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={g}",
+                "brand_name": "",
+                "product_name": "",
+                "original_price": None,
+                "discount_price": None,
+                "discount_rate": None,
+                "ranking_tags": "review_only",
+                "review_count": stats.get("review_count"),
+                "rating": stats.get("rating"),
+            })
+
+        _write_output(
+            out_dir,
+            rows,
+            [],
+            args,
+            run_id,
+            review_summary=review_summary,
+            browser_engine="review-only",
+        )
+        print(
+            f"[INFO] 리뷰 단독 테스트 완료: success={review_success}, fail={review_fail}, "
+            f"rate={review_summary['rate']}%"
+        )
+        return
+
+    browser_engine = args.browser_engine
+
+    if browser_engine == "auto":
+        if USE_CAMOUFOX:
+            browser_engine = "camoufox"
+        elif _SYNC_PLAYWRIGHT is not None:
+            browser_engine = "playwright"
+        else:
+            browser_engine = "none"
+    elif browser_engine == "camoufox" and not USE_CAMOUFOX:
+        print("ERROR: --browser-engine=camoufox 선택이지만 camoufox가 미설치입니다.", file=sys.stderr)
+        print("  pip install camoufox 로 설치하세요.", file=sys.stderr)
+        sys.exit(1)
+    elif browser_engine == "playwright" and _SYNC_PLAYWRIGHT is None:
+        print(
+            "ERROR: --browser-engine=playwright 선택이지만 patchright/playwright가 미설치입니다.",
+            file=sys.stderr,
+        )
+        print("  pip install patchright 또는 playwright 로 설치하세요.", file=sys.stderr)
+        sys.exit(1)
+
+    if browser_engine == "none":
+        print("ERROR: camoufox / patchright / playwright 모두 미설치.", file=sys.stderr)
+        print("  pip install camoufox 또는 patchright 또는 playwright", file=sys.stderr)
+        sys.exit(1)
+
+    if browser_engine == "camoufox":
+        print("[INFO] 브라우저 엔진: camoufox (Firefox + BrowserForge)")
+    else:
+        print("[INFO] 브라우저 엔진: playwright (chromium)")
 
     # persistent context용 user_data_dir (브라우저 엔진별 분리)
     profile_name = ".browser_profile_camoufox" if USE_CAMOUFOX else ".browser_profile"
@@ -749,11 +933,69 @@ def run() -> None:
         )
         print(f"[INFO] 리뷰 캐시 로드: {len(review_cache)}건")
 
+    if args.dry_run:
+        print("[WARN] dry-run 모드: 브라우저 호출 없이 목업 데이터 생성")
+        category_count = min(args.category_limit, len(DEFAULT_CATEGORIES)) if args.category_limit > 0 else 0
+        row_repeat = max(0, args.dry_run_rows)
+        for idx in range(category_count):
+            category = DEFAULT_CATEGORIES[idx]
+            for rank in range(1, row_repeat + 1):
+                rows.append({
+                    "collected_at_utc": now_iso(),
+                    "category_code": category["code"],
+                    "category_name": category["name"],
+                    "rank": rank,
+                    "goods_no": f"DRY-{category['code']}-{rank:03d}",
+                    "detail_disp_cat_no": category.get("disp_cat_no") or "",
+                    "detail_url": f"https://www.oliveyoung.co.kr/{category['code']}",
+                    "brand_name": "dry-run",
+                    "product_name": f"목업상품-{category['name']}-{rank}",
+                    "original_price": 1000 * rank,
+                    "discount_price": 800 * rank,
+                    "discount_rate": None,
+                    "ranking_tags": "dry-run",
+                    "review_count": None,
+                    "rating": None,
+                })
+            category_summaries.append({
+                "categoryCode": category["code"],
+                "categoryName": category["name"],
+                "challengeDetected": False,
+                "goodsCount": row_repeat,
+                "rankMin": 1 if row_repeat > 0 else None,
+                "rankMax": row_repeat if row_repeat > 0 else None,
+                "urlAfterClick": args.url,
+            })
+
+        review_summary = {
+            "total": len(rows),
+            "cacheHit": 0,
+            "cacheHitRate": 0,
+            "success": 0,
+            "fail": len(rows),
+            "rate": 0.0,
+        }
+        _write_output(
+            out_dir,
+            rows,
+            category_summaries,
+            args,
+            run_id,
+            review_summary=review_summary,
+            browser_engine=browser_engine,
+        )
+        if len(rows) < args.min_rows:
+            print(
+                f"[WARN] dry-run 건수({len(rows)})가 min_rows({args.min_rows}) 미만. "
+                "실제 모드에서는 최소 조건 재설정이 필요합니다."
+            )
+        return
+
     # 브라우저 엔진 선택
-    if USE_CAMOUFOX:
+    if browser_engine == "camoufox":
         browser_ctx = _crawl_with_camoufox(args, user_data_dir)
     else:
-        browser_ctx = _crawl_with_patchright(args, user_data_dir)
+        browser_ctx = _crawl_with_playwright(args, user_data_dir)
 
     try:
         with browser_ctx as context:
@@ -787,7 +1029,14 @@ def run() -> None:
 
             if not loaded:
                 print("[ERROR] CF 챌린지를 통과할 수 없음. 모든 재시도 실패.")
-                _write_output(out_dir, rows, category_summaries, args, run_id)
+                _write_output(
+                    out_dir,
+                    rows,
+                    category_summaries,
+                    args,
+                    run_id,
+                    browser_engine=browser_engine,
+                )
                 sys.exit(1)
 
             print("[INFO] 페이지 로드 성공!")
@@ -807,7 +1056,14 @@ def run() -> None:
 
             if not target_categories:
                 print("[ERROR] 카테고리를 찾을 수 없음")
-                _write_output(out_dir, rows, category_summaries, args, run_id)
+                _write_output(
+                    out_dir,
+                    rows,
+                    category_summaries,
+                    args,
+                    run_id,
+                    browser_engine=browser_engine,
+                )
                 sys.exit(1)
 
             consecutive_fails = 0
@@ -984,7 +1240,14 @@ def run() -> None:
                 pass
 
     except Exception:
-        _write_output(out_dir, rows, category_summaries, args, run_id)
+        _write_output(
+            out_dir,
+            rows,
+            category_summaries,
+            args,
+            run_id,
+            browser_engine=browser_engine,
+        )
         raise
 
     # 리뷰 통계 API 호출 (curl_cffi HTTP, 브라우저 세션 불필요)
@@ -1064,7 +1327,15 @@ def run() -> None:
         "fail": review_fail,
         "rate": round(review_success / review_total * 100, 1) if review_total else 0,
     }
-    _write_output(out_dir, rows, category_summaries, args, run_id, review_summary)
+    _write_output(
+        out_dir,
+        rows,
+        category_summaries,
+        args,
+        run_id,
+        review_summary=review_summary,
+        browser_engine=browser_engine,
+    )
 
     # 최소 건수 검증 → 미달 시 exit 1
     if len(rows) < args.min_rows:
@@ -1081,6 +1352,7 @@ def _write_output(
     args: argparse.Namespace,
     run_id: str,
     review_summary: dict | None = None,
+    browser_engine: str = "unknown",
 ) -> None:
     """파일 출력 (성공/실패 모두 기록)."""
     csv_headers = [
@@ -1103,6 +1375,7 @@ def _write_output(
 
     summary = {
         "runId": run_id,
+        "browserEngine": browser_engine,
         "startedAt": now_iso(),
         "finishedAt": now_iso(),
         "targetUrl": args.url,
