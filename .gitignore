@@ -8,3 +8,7 @@ output/
 *.log
 __pycache__/
 *.pyc
+.browser_profile/
+.browser_profile_camoufox/
+=
+.venv/
