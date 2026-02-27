@@ -187,97 +187,63 @@ def build_detail_url(href: str) -> str | None:
     return urljoin("https://www.oliveyoung.co.kr", href)
 
 
-def fetch_review_stats_http(goods_nos: list[str]) -> dict[str, dict]:
-    """curl_cffi로 리뷰 API 호출 (브라우저 TLS 핑거프린트 위장).
+def fetch_review_stats_http(goods_nos: list[str], batch_size: int = 100) -> dict[str, dict]:
+    """curl_cffi로 리뷰 API 호출 — 배치별 세션 교체로 CF rate limit 우회.
 
-    page.goto()로 JSON API를 방문하면 CF가 봇으로 인식하여 ~300건 후 차단.
-    curl_cffi + impersonate="chrome"는 TLS/HTTP2 핑거프린트를 위장하여 CF 통과.
-
-    Rate limit 대응:
-    - 요청 간 50~150ms 랜덤 딜레이 (인간적 패턴)
-    - 연속 실패 감지 시 세션 재생성 + 쿨다운 대기 후 재시도
-    - 최대 3회 세션 재생성 후에도 실패 시 중단
+    100건마다 세션을 닫고 새로 생성하여 CF가 동일 세션의 대량 요청으로
+    인식하지 못하게 함. 배치 간 3~5초 쿨다운으로 자연스러운 패턴 유지.
     """
     from curl_cffi import requests as cffi_requests
 
-    IMPERSONATE_LIST = ["chrome", "chrome110", "chrome116", "chrome120", "safari"]
-
-    def _new_session(idx: int = 0) -> cffi_requests.Session:
-        browser = IMPERSONATE_LIST[idx % len(IMPERSONATE_LIST)]
-        return cffi_requests.Session(impersonate=browser)
-
-    session = _new_session(0)
+    BROWSERS = ["chrome", "chrome110", "chrome116", "chrome120", "safari"]
     total = len(goods_nos)
     results: dict[str, dict] = {}
     fails = 0
-    consecutive_fails = 0
-    session_resets = 0
-    max_session_resets = 3
 
-    def _fetch_one(gno: str) -> bool:
-        """단일 상품 리뷰 통계 조회. 성공 시 True."""
-        nonlocal fails, consecutive_fails
-        url = f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{gno}/stats"
-        try:
-            resp = session.get(url, timeout=10)
-            data = resp.json()
-            if data.get("status") == "SUCCESS":
-                d = data["data"]
-                results[gno] = {
-                    "review_count": d.get("reviewCount"),
-                    "rating": d.get("ratingDistribution", {}).get("averageRating"),
-                }
-                consecutive_fails = 0
-                return True
-            else:
-                fails += 1
-                consecutive_fails += 1
-                return False
-        except Exception:
-            fails += 1
-            consecutive_fails += 1
-            return False
+    # 배치 분할
+    batches = [goods_nos[i:i + batch_size] for i in range(0, total, batch_size)]
+    print(f"[INFO] 리뷰 API: {total}건 → {len(batches)}개 배치 (배치당 {batch_size}건)")
 
-    # Fail-fast: 첫 5건 테스트
-    test_size = min(5, total)
-    test_fails = 0
-    for gno in goods_nos[:test_size]:
-        if not _fetch_one(gno):
-            test_fails += 1
-        time.sleep(random.uniform(0.2, 0.5))
+    for batch_idx, batch in enumerate(batches):
+        browser = BROWSERS[batch_idx % len(BROWSERS)]
+        session = cffi_requests.Session(impersonate=browser)
+        batch_ok = 0
+        batch_fail = 0
 
-    if test_fails >= 3:
-        print(f"[ERROR] 리뷰 API 테스트 실패 ({test_fails}/{test_size}). 수집 중단.")
-        return results
+        for gno in batch:
+            url = f"https://m.oliveyoung.co.kr/review/api/v2/reviews/{gno}/stats"
+            try:
+                resp = session.get(url, timeout=10)
+                data = resp.json()
+                if data.get("status") == "SUCCESS":
+                    d = data["data"]
+                    results[gno] = {
+                        "review_count": d.get("reviewCount"),
+                        "rating": d.get("ratingDistribution", {}).get("averageRating"),
+                    }
+                    batch_ok += 1
+                else:
+                    batch_fail += 1
+            except Exception:
+                batch_fail += 1
+            time.sleep(random.uniform(0.05, 0.15))
 
-    print(f"[INFO] 리뷰 API 테스트 통과 ({test_size - test_fails}/{test_size})")
+        fails += batch_fail
+        session.close()
 
-    # 나머지 처리
-    for i, gno in enumerate(goods_nos[test_size:]):
-        _fetch_one(gno)
+        print(f"[INFO] 배치 {batch_idx + 1}/{len(batches)} 완료: {batch_ok}건 성공, {batch_fail}건 실패 ({browser})")
 
-        # 연속 5건 실패 → 세션 재생성 + 쿨다운
-        if consecutive_fails >= 5:
-            session_resets += 1
-            if session_resets > max_session_resets:
-                print(f"[WARN] 세션 재생성 {max_session_resets}회 초과, 수집 중단.")
-                break
-            cooldown = 10 * session_resets  # 10초, 20초, 30초
-            print(f"[WARN] 연속 {consecutive_fails}건 실패, 세션 재생성 ({session_resets}/{max_session_resets}), {cooldown}초 쿨다운...")
-            session.close()
+        # 배치 실패율 체크: 첫 배치에서 80% 이상 실패 시 즉시 중단
+        if batch_idx == 0 and batch_fail > len(batch) * 0.8:
+            print(f"[ERROR] 첫 배치 실패율 과다 ({batch_fail}/{len(batch)}). 수집 중단.")
+            break
+
+        # 배치 간 쿨다운 (마지막 배치 제외)
+        if batch_idx < len(batches) - 1:
+            cooldown = random.uniform(3.0, 5.0)
             time.sleep(cooldown)
-            session = _new_session(session_resets)
-            consecutive_fails = 0
 
-        # 요청 간 랜덤 딜레이 (50~150ms)
-        time.sleep(random.uniform(0.2, 0.5))
-
-        # 진행 로그 (200건마다 + 마지막)
-        done = i + test_size + 1
-        if done % 200 == 0 or done == total:
-            print(f"[INFO] 리뷰 API: {done}/{total} (성공 {len(results)}, 실패 {fails})")
-
-    print(f"[INFO] 리뷰 API 최종: {len(results)}/{total} 성공 ({fails}건 실패, 세션리셋 {session_resets}회)")
+    print(f"[INFO] 리뷰 API 최종: {len(results)}/{total} 성공 ({fails}건 실패)")
     return results
 
 
