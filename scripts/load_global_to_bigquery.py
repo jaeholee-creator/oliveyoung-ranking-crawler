@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""수집된 글로벌 올리브영 베스트셀러 JSON을 BigQuery에 적재하는 스크립트"""
+
+import json
+import sys
+import os
+from google.cloud import bigquery
+from google.oauth2 import service_account
+
+PROJECT_ID = "member-378109"
+DATASET_ID = "jaeho"
+TABLE_ID = "global_oliveyoung_best_seller"
+FULL_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+KEY_PATH = os.environ.get(
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    os.path.expanduser("~/Downloads/target-378109-7f1aa3e0dc9a.json"),
+)
+
+
+def load_to_bigquery(json_path: str) -> int | None:
+    creds = service_account.Credentials.from_service_account_file(
+        KEY_PATH,
+        scopes=["https://www.googleapis.com/auth/bigquery"],
+    )
+    client = bigquery.Client(project=PROJECT_ID, credentials=creds)
+
+    with open(json_path) as f:
+        rows = json.load(f)
+
+    bq_rows = [
+        {
+            "collected_at": r["collected_at_utc"],
+            "tab_no": r["tab_no"],
+            "tab_name": r["tab_name"],
+            "category_no": r["category_no"],
+            "category_name": r["category_name"],
+            "rank": r["rank"],
+            "product_no": r["product_no"],
+            "brand_name": r.get("brand_name"),
+            "product_name": r.get("product_name"),
+            "rating": r.get("rating"),
+            "review_count": r.get("review_count"),
+            "original_price": r.get("original_price"),
+            "sale_price": r.get("sale_price"),
+            "discount_rate": r.get("discount_rate"),
+            "sell_status_code": r.get("sell_status_code"),
+            "tags": r.get("tags"),
+            "detail_url": r.get("detail_url"),
+            "image_url": r.get("image_url"),
+        }
+        for r in rows
+    ]
+
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
+    job = client.load_table_from_json(bq_rows, FULL_TABLE_ID, job_config=job_config)
+    job.result()
+
+    print(f"BigQuery 적재 완료: {job.output_rows}행 -> {FULL_TABLE_ID}")
+    return job.output_rows
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python load_global_to_bigquery.py <global_best_seller_rows.json>")
+        sys.exit(1)
+    load_to_bigquery(sys.argv[1])
