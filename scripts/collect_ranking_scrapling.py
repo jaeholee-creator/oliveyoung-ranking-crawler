@@ -423,7 +423,7 @@ def extract_items(page: Any) -> list[dict]:
                 const discountPriceText = pickText('.prd_price .tx_cur .tx_num', node)
                     || pickText('[class*=\"sale_price\"]', node)
                     || '';
-                const tags = Array.from(node.querySelectorAll('.prd_flag .icon_flag, .tx_badge, [class*=\"badge\"]'))
+                const tags = Array.from(node.querySelectorAll('.prd_flag .icon_flag, .tx_badge, [class*=\"badge\"], [class*=\"Flag_flag\"]'))
                     .map((node) => (node.textContent || '').trim())
                     .filter(Boolean);
 
