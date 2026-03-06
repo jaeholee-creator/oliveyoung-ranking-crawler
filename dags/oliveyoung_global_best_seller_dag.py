@@ -1,7 +1,7 @@
 """
 글로벌 올리브영 베스트셀러 수집 DAG
 
-- 스케줄: 매시 55분 (55 * * * *)
+- 스케줄: 매시 30분 (30 * * * *)
 - 파이프라인: 크롤링 → BigQuery 적재 → 정리 → Slack 알림
 - 대상: global.oliveyoung.com (Top Orders + Top in Korea)
 - 저장: member-378109.jaeho.global_oliveyoung_best_seller
@@ -31,6 +31,67 @@ GLOBAL_ENRICH_REVIEWS = Variable.get("global_best_seller_enrich_reviews", defaul
 TARGET_URL = "https://global.oliveyoung.com/display/page/best-seller?target=pillsTab1Nav1"
 BQ_TABLE = "member-378109.jaeho.global_oliveyoung_best_seller"
 
+
+def _send_slack_alert(channel, token, blocks, fallback_text):
+    """Slack 알림 발송 헬퍼"""
+    payload = json.dumps({
+        "channel": channel,
+        "blocks": blocks,
+        "text": fallback_text,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://slack.com/api/chat.postMessage",
+        data=payload,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    resp = urllib.request.urlopen(req)
+    result = json.loads(resp.read())
+    if not result.get("ok"):
+        raise RuntimeError(f"Slack 발송 실패: {result.get('error')}")
+
+
+def _on_failure_callback(context):
+    """태스크 실패 시 Slack 알림"""
+    if not SLACK_BOT_TOKEN:
+        return
+
+    ti = context["task_instance"]
+    dag_id = ti.dag_id
+    task_id = ti.task_id
+    execution_date = context["execution_date"].strftime("%Y-%m-%d %H:%M KST")
+    exception = str(context.get("exception", "Unknown error"))
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "🚨 글로벌 올리브영 베스트셀러 수집 실패"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*DAG*\n`{dag_id}`"},
+                {"type": "mrkdwn", "text": f"*Task*\n`{task_id}`"},
+                {"type": "mrkdwn", "text": f"*실행 시각*\n{execution_date}"},
+                {"type": "mrkdwn", "text": f"*시도 횟수*\n{ti.try_number}"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*에러*\n```{exception[:500]}```"},
+        },
+    ]
+
+    try:
+        _send_slack_alert(SLACK_CHANNEL_ID, SLACK_BOT_TOKEN, blocks,
+                          f"🚨 글로벌 올리브영 수집 실패: {task_id}")
+    except Exception as exc:
+        print(f"[WARN] 실패 알림 발송 오류: {exc}")
+
+
 default_args = {
     "owner": "jaeho",
     "depends_on_past": False,
@@ -38,12 +99,13 @@ default_args = {
     "email_on_retry": False,
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
+    "on_failure_callback": _on_failure_callback,
 }
 
 dag = DAG(
     dag_id="oliveyoung_global_best_seller",
     default_args=default_args,
-    description="글로벌 올리브영 베스트셀러 수집 및 BigQuery 적재 (매시 55분)",
+    description="글로벌 올리브영 베스트셀러 수집 및 BigQuery 적재 (매시 30분)",
     schedule_interval="30 * * * *",  # 매시 30분
     start_date=datetime(2026, 2, 27),
     catchup=False,
@@ -154,7 +216,7 @@ cleanup = PythonOperator(
 
 
 def _send_slack_notification(**context):
-    """DAG 실행 결과를 Slack으로 발송 (토큰 없으면 스킵)"""
+    """문제 발생 시에만 Slack 알림 (정상 수행 시 스킵)"""
     if not SLACK_BOT_TOKEN:
         print("SLACK_BOT_TOKEN이 설정되지 않아 알림을 스킵합니다.")
         return
@@ -167,14 +229,23 @@ def _send_slack_notification(**context):
     run_id = os.path.basename(source_dir) if source_dir else "unknown"
     execution_date = context["execution_date"].strftime("%Y-%m-%d %H:%M KST")
 
-    status_emoji = "⚠️" if error_count > 0 else "✅"
+    # 문제 감지
+    issues = []
+    if error_count > 0:
+        issues.append(f"카테고리 수집 오류: {error_count}건 실패")
+    if loaded_rows == 0:
+        issues.append("수집 데이터 0건")
+
+    if not issues:
+        print(f"[OK] 정상 수집 완료 — {loaded_rows:,}건 적재, 카테고리 {category_count}개, 알림 스킵")
+        return
 
     blocks = [
         {
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": "🌍 글로벌 올리브영 베스트셀러 수집 완료",
+                "text": "⚠️ 글로벌 올리브영 베스트셀러 수집 — 문제 감지",
             },
         },
         {
@@ -183,57 +254,30 @@ def _send_slack_notification(**context):
                 {"type": "mrkdwn", "text": f"*실행 시각*\n{execution_date}"},
                 {"type": "mrkdwn", "text": f"*Run ID*\n`{run_id}`"},
                 {"type": "mrkdwn", "text": f"*적재 건수*\n{loaded_rows:,}건"},
-                {"type": "mrkdwn", "text": f"*카테고리*\n{category_count}개 {status_emoji}"},
+                {"type": "mrkdwn", "text": f"*카테고리*\n{category_count}개"},
             ],
         },
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*BigQuery 테이블*\n`{BQ_TABLE}`",
+                "text": "*감지된 문제*\n" + "\n".join(f"• {issue}" for issue in issues),
             },
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"📊 Airflow DAG: `oliveyoung_global_best_seller` | `{BQ_TABLE}`",
+                }
+            ],
         },
     ]
 
-    if error_count > 0:
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"⚠️ *카테고리 수집 오류*: {error_count}건 실패",
-            },
-        })
-
-    blocks.append({
-        "type": "context",
-        "elements": [
-            {
-                "type": "mrkdwn",
-                "text": "📊 Airflow DAG: `oliveyoung_global_best_seller` | 매시 55분 자동 수집",
-            }
-        ],
-    })
-
-    payload = json.dumps({
-        "channel": SLACK_CHANNEL_ID,
-        "blocks": blocks,
-        "text": f"글로벌 올리브영 베스트셀러 수집 완료: {loaded_rows:,}건 적재",
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://slack.com/api/chat.postMessage",
-        data=payload,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-        },
-    )
-
-    resp = urllib.request.urlopen(req)
-    result = json.loads(resp.read())
-    if not result.get("ok"):
-        raise RuntimeError(f"Slack 발송 실패: {result.get('error')}")
-    print(f"Slack 알림 발송 완료: channel={SLACK_CHANNEL_ID}")
+    _send_slack_alert(SLACK_CHANNEL_ID, SLACK_BOT_TOKEN, blocks,
+                      f"⚠️ 글로벌 올리브영 수집 문제: {', '.join(issues)}")
+    print(f"Slack 알림 발송 완료: {issues}")
 
 
 notify_slack = PythonOperator(

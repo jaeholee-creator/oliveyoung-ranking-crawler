@@ -49,6 +49,67 @@ TARGET_URL = (
 # 최소 수집 건수 (미달 시 크롤러가 exit 1 → Airflow가 retry)
 MIN_ROWS = 2100
 
+
+def _send_slack_alert(channel, token, blocks, fallback_text):
+    """Slack 알림 발송 헬퍼"""
+    payload = json.dumps({
+        "channel": channel,
+        "blocks": blocks,
+        "text": fallback_text,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://slack.com/api/chat.postMessage",
+        data=payload,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    resp = urllib.request.urlopen(req)
+    result = json.loads(resp.read())
+    if not result.get("ok"):
+        raise RuntimeError(f"Slack 발송 실패: {result.get('error')}")
+
+
+def _on_failure_callback(context):
+    """태스크 실패 시 Slack 알림"""
+    if not SLACK_BOT_TOKEN:
+        return
+
+    ti = context["task_instance"]
+    dag_id = ti.dag_id
+    task_id = ti.task_id
+    execution_date = context["execution_date"].strftime("%Y-%m-%d %H:%M KST")
+    exception = str(context.get("exception", "Unknown error"))
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "🚨 올리브영 랭킹 수집 실패"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*DAG*\n`{dag_id}`"},
+                {"type": "mrkdwn", "text": f"*Task*\n`{task_id}`"},
+                {"type": "mrkdwn", "text": f"*실행 시각*\n{execution_date}"},
+                {"type": "mrkdwn", "text": f"*시도 횟수*\n{ti.try_number}"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*에러*\n```{exception[:500]}```"},
+        },
+    ]
+
+    try:
+        _send_slack_alert(SLACK_CHANNEL_ID, SLACK_BOT_TOKEN, blocks,
+                          f"🚨 올리브영 랭킹 수집 실패: {task_id}")
+    except Exception as exc:
+        print(f"[WARN] 실패 알림 발송 오류: {exc}")
+
+
 default_args = {
     "owner": "jaeho",
     "depends_on_past": False,
@@ -58,6 +119,7 @@ default_args = {
     "retry_delay": timedelta(minutes=CRAWL_RETRY_DELAY_MINUTES),
     "retry_exponential_backoff": True,
     "max_retry_delay": timedelta(minutes=8),
+    "on_failure_callback": _on_failure_callback,
 }
 
 dag = DAG(
@@ -213,7 +275,7 @@ cleanup = PythonOperator(
 )
 
 def _send_slack_notification(**context):
-    """DAG 실행 결과를 Slack으로 발송 (토큰 없으면 스킵)"""
+    """문제 발생 시에만 Slack 알림 (정상 수행 시 스킵)"""
     if not SLACK_BOT_TOKEN:
         print("SLACK_BOT_TOKEN이 설정되지 않아 알림을 스킵합니다.")
         return
@@ -231,6 +293,22 @@ def _send_slack_notification(**context):
     review_rate = ti.xcom_pull(task_ids="load_to_bigquery", key="review_rate") or 0.0
     review_alert = ti.xcom_pull(task_ids="load_to_bigquery", key="review_alert") or False
 
+    # 문제 감지
+    issues = []
+    if review_alert:
+        issues.append(f"리뷰 성공률 저조: {review_rate}% (임계값 {MIN_REVIEW_RATE}%)")
+    try:
+        if int(categories_captured) < CATEGORY_LIMIT:
+            issues.append(f"카테고리 수집 부족: {categories_captured}/{CATEGORY_LIMIT}개")
+    except (TypeError, ValueError):
+        pass
+    if loaded_rows < MIN_ROWS:
+        issues.append(f"수집 건수 부족: {loaded_rows:,}건 (최소 {MIN_ROWS:,}건)")
+
+    if not issues:
+        print(f"[OK] 정상 수집 완료 — {loaded_rows:,}건 적재, 리뷰 {review_rate}%, 알림 스킵")
+        return
+
     if review_fail == 0:
         review_status = f"✅ {review_success:,}/{review_total:,} ({review_rate}%)"
     elif review_rate >= 99.0:
@@ -243,7 +321,7 @@ def _send_slack_notification(**context):
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": "🛒 올리브영 랭킹 수집 완료",
+                "text": "⚠️ 올리브영 랭킹 수집 — 문제 감지",
             },
         },
         {
@@ -252,8 +330,7 @@ def _send_slack_notification(**context):
                 {"type": "mrkdwn", "text": f"*실행 시각*\n{execution_date}"},
                 {"type": "mrkdwn", "text": f"*Run ID*\n`{run_id}`"},
                 {"type": "mrkdwn", "text": f"*적재 건수*\n{loaded_rows:,}건"},
-                {"type": "mrkdwn", "text": f"*카테고리*\n{CATEGORY_LIMIT}개"},
-                {"type": "mrkdwn", "text": f"*적재 카테고리*\n{categories_captured}개"},
+                {"type": "mrkdwn", "text": f"*카테고리*\n{categories_captured}/{CATEGORY_LIMIT}개"},
             ],
         },
         {
@@ -266,7 +343,7 @@ def _send_slack_notification(**context):
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": "*BigQuery 테이블*\n`member-378109.jaeho.oliveyoung_ranking`",
+                "text": "*감지된 문제*\n" + "\n".join(f"• {issue}" for issue in issues),
             },
         },
         {
@@ -280,28 +357,9 @@ def _send_slack_notification(**context):
         },
     ]
 
-    payload = json.dumps({
-        "channel": SLACK_CHANNEL_ID,
-        "blocks": blocks,
-        "text": f"올리브영 랭킹 수집 완료: {loaded_rows:,}건 적재",
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://slack.com/api/chat.postMessage",
-        data=payload,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-        },
-    )
-
-    resp = urllib.request.urlopen(req)
-    result = json.loads(resp.read())
-    if not result.get("ok"):
-        raise RuntimeError(f"Slack 발송 실패: {result.get('error')}")
-    if review_alert:
-        print(f"[WARN] 리뷰 성공률 저조: {review_rate}% (임계값 {MIN_REVIEW_RATE}%)")
-    print(f"Slack 알림 발송 완료: channel={SLACK_CHANNEL_ID}")
+    _send_slack_alert(SLACK_CHANNEL_ID, SLACK_BOT_TOKEN, blocks,
+                      f"⚠️ 올리브영 랭킹 수집 문제: {', '.join(issues)}")
+    print(f"Slack 알림 발송 완료: {issues}")
 
 
 notify_slack = PythonOperator(
