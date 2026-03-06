@@ -34,6 +34,10 @@ MAX_CF_RETRIES = 3
 CF_WAIT_SECONDS = 15
 REVIEW_API = "https://m.oliveyoung.co.kr/review/api/v2/reviews/{goods_no}/stats"
 ALT_REVIEW_API = "https://product-review-service.oliveyoung.com/api/v1/domestic-reviews/count"
+DETAIL_SHORT_URL = "https://www.oliveyoung.co.kr/store/G.do?goodsNo={goods_no}"
+DESCRIPTION_API = "https://www.oliveyoung.co.kr/goods/api/v1/description?goodsNumber={goods_no}"
+EXTRA_API = "https://www.oliveyoung.co.kr/goods/api/v1/extra"
+QNA_API = "https://www.oliveyoung.co.kr/claim-front/api/v1/goods/getGoodsQnACount?goodsNo={goods_no}"
 BROWSERS = ["chrome", "chrome120", "safari"]
 DEFAULT_CATEGORY_LIMIT = 21
 DEFAULT_MIN_ROWS = 2100
@@ -51,6 +55,9 @@ REVIEW_WORKER_HARD_CAP = 24
 REVIEW_CACHE_FILE = Path("cache/review_cache.json")
 REVIEW_CACHE_TTL_HOURS = 8.0
 REVIEW_CACHE_MAX_ENTRIES = 30000
+DETAIL_WORKERS = 6
+DETAIL_RETRIES = 2
+DETAIL_TIMEOUT = 15.0
 
 
 DEFAULT_CATEGORIES = [
@@ -111,6 +118,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--review-workers", type=int, default=REVIEW_WORKERS, help="리뷰 API 동시 요청 수")
     parser.add_argument("--review-retries", type=int, default=REVIEW_RETRIES, help="리뷰 API 재시도 횟수")
     parser.add_argument("--review-timeout", type=float, default=REVIEW_TIMEOUT, help="리뷰 API 타임아웃(초)")
+    parser.add_argument("--detail-workers", type=int, default=DETAIL_WORKERS, help="상세/extra API 동시 요청 수")
+    parser.add_argument("--detail-retries", type=int, default=DETAIL_RETRIES, help="상세/extra API 재시도 횟수")
+    parser.add_argument("--detail-timeout", type=float, default=DETAIL_TIMEOUT, help="상세/extra API 타임아웃(초)")
     parser.add_argument("--category-sort-by-page", action="store_true", default=False, help="추출된 버튼 순서 대신 기본 카테고리 순서 사용")
     parser.add_argument(
         "--category-rows",
@@ -561,6 +571,418 @@ def build_detail_url(href: str) -> str | None:
     return urljoin("https://www.oliveyoung.co.kr", href)
 
 
+def _extract_rsc(html: str) -> str:
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)', html)
+    result = ""
+    for chunk in chunks:
+        try:
+            result += json.loads(f'"{chunk}"')
+        except Exception:
+            result += chunk
+    return result
+
+
+def _build_extra_api_body(goods_no: str, rsc: str) -> dict[str, Any] | None:
+    def find(key: str) -> str | None:
+        m = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]+)"', rsc)
+        return m.group(1) if m else None
+
+    goods_type = find("goodsTypeCode")
+    supplier = find("supplier") or ""
+    online_brand = find("onlineBrand") or ""
+    if not goods_type or not supplier or not online_brand:
+        return None
+
+    lower_category_number = find("lowerCategoryNumber") or ""
+    brand = find("brand") or ""
+    options_raw = re.findall(
+        r'"goodsNumber":"[^"]+","optionNumber":"([^"]+)","standardCode":"([^"]+)","optionName":"([^"]*)"',
+        rsc,
+    )
+    options = [
+        {
+            "goodsNumber": goods_no,
+            "optionNumber": option_number,
+            "standardCode": standard_code,
+            "optionName": option_name,
+            "brand": brand,
+            "lowerCategoryNumber": lower_category_number,
+        }
+        for option_number, standard_code, option_name in options_raw
+    ]
+    if not options:
+        standard_code = find("standardCode")
+        if standard_code:
+            options = [
+                {
+                    "goodsNumber": goods_no,
+                    "optionNumber": "001",
+                    "standardCode": standard_code,
+                    "optionName": "",
+                    "brand": brand,
+                    "lowerCategoryNumber": lower_category_number,
+                }
+            ]
+    if not options:
+        return None
+
+    return {
+        "goodsNumber": goods_no,
+        "goodsTypeCode": goods_type,
+        "goodsSectionCode": find("goodsSectionCode") or "10",
+        "deliveryPolicyNumber": find("deliveryPolicyNumber") or "1",
+        "tradeCode": find("tradeCode") or "1",
+        "supplier": supplier,
+        "onlineBrand": online_brand,
+        "brand": brand,
+        "options": options,
+    }
+
+
+def _find_meta_content(html: str, attr_name: str, attr_value: str) -> str | None:
+    escaped = re.escape(attr_value)
+    patterns = [
+        rf'<meta[^>]+{attr_name}=["\']{escaped}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+{attr_name}=["\']{escaped}["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _rsc_find_string(rsc: str, key: str) -> str | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', rsc)
+    return match.group(1) if match else None
+
+
+def _rsc_find_bool(rsc: str, key: str) -> bool | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*(true|false)', rsc)
+    if not match:
+        return None
+    return match.group(1) == "true"
+
+
+def _rsc_object_block(rsc: str, object_key: str) -> str:
+    match = re.search(rf'"{re.escape(object_key)}"\s*:\s*\{{([^{{}}]+)\}}', rsc)
+    return match.group(1) if match else ""
+
+
+def _rsc_find_from_block(block: str, key: str) -> str | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', block)
+    return match.group(1) if match else None
+
+
+def _rsc_combine_url_path(rsc: str, object_key: str) -> str | None:
+    match = re.search(
+        rf'"{re.escape(object_key)}"\s*:\s*\{{"url":"([^"]+)","path":"([^"]+)"',
+        rsc,
+    )
+    if not match:
+        return None
+    return f"{match.group(1).rstrip('/')}/{match.group(2).lstrip('/')}"
+
+
+def _extract_description_image_urls(description_contents: str) -> list[str]:
+    seen: set[str] = set()
+    image_urls: list[str] = []
+    for url in re.findall(r'(?:data-src|src)="([^"]+)"', description_contents or ""):
+        if not url or url.startswith("data:image/") or url in seen:
+            continue
+        seen.add(url)
+        image_urls.append(url)
+    return image_urls
+
+
+def _parse_qna_count(payload: Any) -> int | None:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("qnaCount", "goodsQnACount", "count", "totalCount"):
+                count = to_int(data.get(key))
+                if count is not None:
+                    return count
+        for key in ("qnaCount", "goodsQnACount", "count", "totalCount"):
+            count = to_int(payload.get(key))
+            if count is not None:
+                return count
+    return None
+
+
+def _json_compact(value: Any) -> str | None:
+    if value in (None, "", [], {}):
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _is_challenge_html(html: str) -> bool:
+    lowered = html.lower()
+    return "__cf_chl_opt" in lowered or "just a moment" in lowered or "잠시만 기다려" in html
+
+
+def _build_detail_enrichment_payload(
+    goods_no: str,
+    html: str,
+    rsc: str,
+    extra_payload: dict[str, Any] | None,
+    description_payload: dict[str, Any] | None,
+    qna_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    extra_data = ((extra_payload or {}).get("data") or {}) if isinstance(extra_payload, dict) else {}
+    description_data = ((description_payload or {}).get("data") or {}) if isinstance(description_payload, dict) else {}
+    review_info = (extra_data.get("reviewInfoDto") or {}) if isinstance(extra_data, dict) else {}
+    option_list = (((extra_data.get("optionDetail") or {}).get("optionList")) or []) if isinstance(extra_data, dict) else []
+    option_detail = option_list[0] if option_list else {}
+    description_contents = description_data.get("descriptionContents") if isinstance(description_data, dict) else ""
+    description_image_urls = _extract_description_image_urls(description_contents or "")
+    standard_category_block = _rsc_object_block(rsc, "standardCategory")
+    display_category_block = _rsc_object_block(rsc, "displayCategory")
+
+    item_id = (
+        _find_meta_content(html, "property", "eg:itemId")
+        or option_detail.get("standardCode")
+        or _rsc_find_string(rsc, "standardCode")
+    )
+    option_number = option_detail.get("optionNumber") or _rsc_find_string(rsc, "optionNumber")
+    standard_code = option_detail.get("standardCode") or _rsc_find_string(rsc, "standardCode")
+    option_name = option_detail.get("optionName") or _rsc_find_string(rsc, "optionName")
+    option_image_url = _rsc_combine_url_path(rsc, "optionImage")
+
+    detail_meta = {
+        "item_id": item_id,
+        "og_url": _find_meta_content(html, "property", "og:url"),
+        "og_image_url": _find_meta_content(html, "property", "og:image"),
+        "eg_item_url": _find_meta_content(html, "property", "eg:itemUrl"),
+        "goods_type_code": _rsc_find_string(rsc, "goodsTypeCode"),
+        "goods_section_code": _rsc_find_string(rsc, "goodsSectionCode"),
+        "trade_code": _rsc_find_string(rsc, "tradeCode"),
+        "delivery_policy_number": _rsc_find_string(rsc, "deliveryPolicyNumber"),
+        "online_brand_code": _rsc_find_string(rsc, "onlineBrand"),
+        "online_brand_name": _rsc_find_string(rsc, "onlineBrandName"),
+        "online_brand_eng_name": _rsc_find_string(rsc, "onlineBrandEngName"),
+        "brand_code": _rsc_find_string(rsc, "brand"),
+        "supplier_code": _rsc_find_string(rsc, "supplier"),
+        "supplier_name": _rsc_find_string(rsc, "supplierName"),
+        "status_code": _rsc_find_string(rsc, "status"),
+        "status_name": _rsc_find_string(rsc, "statusName"),
+        "sold_out_flag": option_detail.get("soldOutFlag"),
+        "registered_at": _rsc_find_string(rsc, "registeredDate"),
+        "modified_at": _rsc_find_string(rsc, "modifiedDate"),
+        "display_start_at": _rsc_find_string(rsc, "displayStartDatetime"),
+        "display_end_at": _rsc_find_string(rsc, "displayEndDatetime"),
+        "standard_category_upper_code": _rsc_find_from_block(standard_category_block, "upperCategory"),
+        "standard_category_upper_name": _rsc_find_from_block(standard_category_block, "upperCategoryName"),
+        "standard_category_middle_code": _rsc_find_from_block(standard_category_block, "middleCategory"),
+        "standard_category_middle_name": _rsc_find_from_block(standard_category_block, "middleCategoryName"),
+        "standard_category_lower_code": _rsc_find_from_block(standard_category_block, "lowerCategory"),
+        "standard_category_lower_name": _rsc_find_from_block(standard_category_block, "lowerCategoryName"),
+        "display_category_upper_number": _rsc_find_from_block(display_category_block, "upperCategoryNumber"),
+        "display_category_upper_name": _rsc_find_from_block(display_category_block, "upperCategoryName"),
+        "display_category_middle_number": _rsc_find_from_block(display_category_block, "middleCategoryNumber"),
+        "display_category_middle_name": _rsc_find_from_block(display_category_block, "middleCategoryName"),
+        "display_category_lower_number": _rsc_find_from_block(display_category_block, "lowerCategoryNumber"),
+        "display_category_lower_name": _rsc_find_from_block(display_category_block, "lowerCategoryName"),
+        "display_category_leaf_number": _rsc_find_from_block(display_category_block, "leafCategoryNumber"),
+        "display_category_leaf_name": _rsc_find_from_block(display_category_block, "leafCategoryName"),
+        "option_number": option_number,
+        "option_name": option_name,
+        "standard_code": standard_code,
+        "option_image_url": option_image_url,
+        "qna_count": _parse_qna_count(qna_payload),
+        "description_type_code": description_data.get("descriptionTypeCode") if isinstance(description_data, dict) else None,
+        "description_image_count": len(description_image_urls),
+        "description_image_urls_json": _json_compact(description_image_urls),
+        "detail_meta_json": _json_compact(
+            {
+                "goods_no": goods_no,
+                "item_id": item_id,
+                "meta": {
+                    "og_url": _find_meta_content(html, "property", "og:url"),
+                    "og_image_url": _find_meta_content(html, "property", "og:image"),
+                    "eg_item_url": _find_meta_content(html, "property", "eg:itemUrl"),
+                },
+                "rsc_fields": {
+                    "goodsTypeCode": _rsc_find_string(rsc, "goodsTypeCode"),
+                    "goodsSectionCode": _rsc_find_string(rsc, "goodsSectionCode"),
+                    "tradeCode": _rsc_find_string(rsc, "tradeCode"),
+                    "deliveryPolicyNumber": _rsc_find_string(rsc, "deliveryPolicyNumber"),
+                    "onlineBrand": _rsc_find_string(rsc, "onlineBrand"),
+                    "brand": _rsc_find_string(rsc, "brand"),
+                    "supplier": _rsc_find_string(rsc, "supplier"),
+                    "supplierName": _rsc_find_string(rsc, "supplierName"),
+                    "registeredDate": _rsc_find_string(rsc, "registeredDate"),
+                    "modifiedDate": _rsc_find_string(rsc, "modifiedDate"),
+                },
+            }
+        ),
+        "extra_data_json": _json_compact(extra_data),
+        "review_count": review_info.get("reviewCnt"),
+        "rating": review_info.get("reviewAvgScore"),
+    }
+    if detail_meta["sold_out_flag"] is None:
+        detail_meta["sold_out_flag"] = _rsc_find_bool(rsc, "soldOutFlag")
+    return detail_meta
+
+
+_detail_threads = threading.local()
+
+
+def _get_detail_session(cffi_requests: Any, browser: str, supports_impersonate: bool, cookies: dict[str, str]):
+    sessions = getattr(_detail_threads, "sessions", None)
+    if sessions is None:
+        sessions = {}
+        _detail_threads.sessions = sessions
+    if browser not in sessions:
+        session = cffi_requests.Session(impersonate=browser) if supports_impersonate else cffi_requests.Session()
+        if cookies:
+            session.cookies.update(cookies)
+        sessions[browser] = session
+    return sessions[browser]
+
+
+def fetch_detail_enrichment_http(
+    goods_nos: list[str],
+    *,
+    detail_urls: dict[str, str] | None = None,
+    playwright_cookies: dict[str, str] | None = None,
+    max_workers: int = DETAIL_WORKERS,
+    timeout: float = DETAIL_TIMEOUT,
+    retries: int = DETAIL_RETRIES,
+) -> dict[str, dict[str, Any]]:
+    try:
+        from curl_cffi import requests as cffi_requests
+        supports_impersonate = True
+    except ImportError:
+        import requests as cffi_requests
+        supports_impersonate = False
+
+    unique_nos = list(dict.fromkeys([x for x in goods_nos if x]))
+    if not unique_nos:
+        return {}
+
+    detail_url_map = detail_urls or {}
+    base_cookies = playwright_cookies or {}
+    print(
+        f"[INFO] 상세 메타 수집: {len(unique_nos)}건 "
+        f"(workers={max_workers}, timeout={timeout}, retries={retries})"
+    )
+
+    def _fetch_one(gno: str, worker_id: int) -> tuple[str, dict[str, Any]]:
+        browser = _pick_browser(worker_id)
+        session = _get_detail_session(cffi_requests, browser, supports_impersonate, base_cookies)
+        html_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.oliveyoung.co.kr/store/main/getBestList.do",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        }
+        api_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://www.oliveyoung.co.kr",
+            "Referer": DETAIL_SHORT_URL.format(goods_no=gno),
+            "User-Agent": html_headers["User-Agent"],
+        }
+
+        for attempt in range(1, retries + 1):
+            try:
+                detail_url = detail_url_map.get(gno) or DETAIL_SHORT_URL.format(goods_no=gno)
+                detail_resp = session.get(
+                    detail_url,
+                    headers=html_headers,
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                status = int(detail_resp.status_code)
+                if status in (403, 429, 500, 502, 503):
+                    time.sleep(_review_backoff(attempt))
+                    continue
+                if status != 200 or _is_challenge_html(detail_resp.text):
+                    return gno, {}
+
+                html = detail_resp.text
+                rsc = _extract_rsc(html)
+                extra_payload = None
+                description_payload = None
+                qna_payload = None
+
+                extra_body = _build_extra_api_body(gno, rsc)
+                if extra_body:
+                    try:
+                        extra_resp = session.post(
+                            EXTRA_API,
+                            json=extra_body,
+                            headers=api_headers,
+                            timeout=timeout,
+                        )
+                        if int(extra_resp.status_code) == 200:
+                            extra_payload = extra_resp.json()
+                    except Exception:
+                        extra_payload = None
+
+                try:
+                    description_resp = session.get(
+                        DESCRIPTION_API.format(goods_no=gno),
+                        headers=api_headers,
+                        timeout=timeout,
+                    )
+                    if int(description_resp.status_code) == 200:
+                        description_payload = description_resp.json()
+                except Exception:
+                    description_payload = None
+
+                try:
+                    qna_resp = session.get(
+                        QNA_API.format(goods_no=gno),
+                        headers=api_headers,
+                        timeout=timeout,
+                    )
+                    if int(qna_resp.status_code) == 200:
+                        qna_payload = qna_resp.json()
+                except Exception:
+                    qna_payload = None
+
+                return gno, _build_detail_enrichment_payload(
+                    gno,
+                    html,
+                    rsc,
+                    extra_payload,
+                    description_payload,
+                    qna_payload,
+                )
+            except Exception as exc:
+                if _is_dns_error(exc):
+                    return gno, {}
+                time.sleep(_review_backoff(attempt))
+
+        return gno, {}
+
+    results: dict[str, dict[str, Any]] = {}
+    worker_count = max(1, min(max_workers, len(unique_nos)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(_fetch_one, gno, idx): gno
+            for idx, gno in enumerate(unique_nos)
+        }
+        for future in as_completed(futures):
+            gno = futures[future]
+            try:
+                key, payload = future.result()
+            except Exception:
+                key, payload = gno, {}
+            results[key] = payload or {}
+
+    success = len([payload for payload in results.values() if payload])
+    print(f"[INFO] 상세 메타 수집 완료: {success}/{len(unique_nos)}건 성공")
+    return {gno: results.get(gno, {}) for gno in unique_nos}
+
+
 def _pick_browser(user_no: int) -> str:
     return BROWSERS[user_no % len(BROWSERS)]
 
@@ -882,6 +1304,7 @@ def run() -> None:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "Z"
     out_dir = Path(os.getcwd()) / args.out_dir / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    playwright_cookies: dict[str, str] = {}
 
     if args.review_only:
         print("[INFO] review-only 모드: 카테고리 수집 없이 리뷰 API만 호출")
@@ -1315,6 +1738,14 @@ def run() -> None:
                     print(f"[WARN] 0건 카테고리 재시도 중 오류: {retry_err}")
 
             try:
+                try:
+                    playwright_cookies = {
+                        cookie["name"]: cookie["value"]
+                        for cookie in context.cookies()
+                        if cookie.get("name") and cookie.get("value")
+                    }
+                except Exception:
+                    playwright_cookies = {}
                 page.close()
             except Exception:
                 pass
@@ -1332,6 +1763,19 @@ def run() -> None:
 
     # 리뷰 통계 API 호출 (curl_cffi HTTP, 브라우저 세션 불필요)
     unique_goods_nos = list({r["goods_no"] for r in rows if r.get("goods_no")})
+    detail_url_map = {
+        row["goods_no"]: row["detail_url"]
+        for row in rows
+        if row.get("goods_no") and row.get("detail_url")
+    }
+    detail_enrichment = fetch_detail_enrichment_http(
+        unique_goods_nos,
+        detail_urls=detail_url_map,
+        playwright_cookies=playwright_cookies,
+        max_workers=args.detail_workers,
+        timeout=args.detail_timeout,
+        retries=args.detail_retries,
+    )
     print(f"[INFO] 리뷰 통계 조회: {len(unique_goods_nos)}개 상품")
 
     review_total = len(unique_goods_nos)
@@ -1395,9 +1839,14 @@ def run() -> None:
     # rows에 리뷰 데이터 병합
     for row in rows:
         gno = row.get("goods_no")
+        detail = detail_enrichment.get(gno, {})
+        for key, value in detail.items():
+            if key in {"review_count", "rating"}:
+                continue
+            row[key] = value
         stats = review_stats.get(gno, {})
-        row["review_count"] = stats.get("review_count")
-        row["rating"] = stats.get("rating")
+        row["review_count"] = stats.get("review_count") if stats.get("review_count") is not None else detail.get("review_count")
+        row["rating"] = stats.get("rating") if stats.get("rating") is not None else detail.get("rating")
 
     review_summary = {
         "total": review_total,
@@ -1441,6 +1890,22 @@ def _write_output(
         "product_name", "original_price", "discount_price", "discount_rate",
         "ranking_tags",
         "review_count", "rating",
+        "item_id", "og_url", "og_image_url", "eg_item_url",
+        "goods_type_code", "goods_section_code", "trade_code", "delivery_policy_number",
+        "online_brand_code", "online_brand_name", "online_brand_eng_name",
+        "brand_code", "supplier_code", "supplier_name",
+        "status_code", "status_name", "sold_out_flag",
+        "registered_at", "modified_at", "display_start_at", "display_end_at",
+        "standard_category_upper_code", "standard_category_upper_name",
+        "standard_category_middle_code", "standard_category_middle_name",
+        "standard_category_lower_code", "standard_category_lower_name",
+        "display_category_upper_number", "display_category_upper_name",
+        "display_category_middle_number", "display_category_middle_name",
+        "display_category_lower_number", "display_category_lower_name",
+        "display_category_leaf_number", "display_category_leaf_name",
+        "option_number", "option_name", "standard_code", "option_image_url",
+        "qna_count", "description_type_code", "description_image_count",
+        "description_image_urls_json", "detail_meta_json", "extra_data_json",
     ]
 
     csv_path = str(out_dir / "ranking_rows.csv")

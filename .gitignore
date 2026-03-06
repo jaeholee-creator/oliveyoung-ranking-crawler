@@ -10,5 +10,7 @@ __pycache__/
 *.pyc
 .browser_profile/
 .browser_profile_camoufox/
+.browser_profile_identity_camoufox/
+.browser_profile_playwright/
 =
 .venv/

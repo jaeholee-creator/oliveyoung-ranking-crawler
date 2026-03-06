@@ -24,6 +24,9 @@ CATEGORY_ROWS = int(Variable.get("oliveyoung_category_rows", default_var="100"))
 REVIEW_WORKERS = int(Variable.get("oliveyoung_review_workers", default_var="18"))
 REVIEW_RETRIES = int(Variable.get("oliveyoung_review_retries", default_var="3"))
 REVIEW_TIMEOUT = float(Variable.get("oliveyoung_review_timeout", default_var="10"))
+DETAIL_WORKERS = int(Variable.get("oliveyoung_detail_workers", default_var="6"))
+DETAIL_RETRIES = int(Variable.get("oliveyoung_detail_retries", default_var="2"))
+DETAIL_TIMEOUT = float(Variable.get("oliveyoung_detail_timeout", default_var="15"))
 CATEGORY_RETRIES = int(Variable.get("oliveyoung_category_retries", default_var="2"))
 PAGE_TIMEOUT_MS = int(Variable.get("oliveyoung_page_timeout_ms", default_var="45000"))
 CATEGORY_SCROLL_ATTEMPTS = int(Variable.get("oliveyoung_category_scroll_attempts", default_var="3"))
@@ -150,6 +153,9 @@ crawl_ranking = BashOperator(
         f"--review-workers {REVIEW_WORKERS} "
         f"--review-retries {REVIEW_RETRIES} "
         f"--review-timeout {REVIEW_TIMEOUT} "
+        f"--detail-workers {DETAIL_WORKERS} "
+        f"--detail-retries {DETAIL_RETRIES} "
+        f"--detail-timeout {DETAIL_TIMEOUT} "
         f"--category-retries {CATEGORY_RETRIES} "
         f"--page-timeout-ms {PAGE_TIMEOUT_MS} "
         f"--category-scroll-attempts {CATEGORY_SCROLL_ATTEMPTS} "
