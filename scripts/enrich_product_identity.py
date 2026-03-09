@@ -27,11 +27,13 @@ from collect_ranking_scrapling import (  # noqa: E402
     CF_WAIT_SECONDS,
     DETAIL_TIMEOUT,
     DETAIL_WORKERS,
+    DETAIL_PROXY_POOL_ENV,
     REVIEW_TIMEOUT,
     USE_CAMOUFOX,
     Camoufox,
     detect_challenge,
     fetch_detail_enrichment_http,
+    parse_proxy_pool,
     simulate_human,
     wait_for_cf_resolution,
 )
@@ -60,12 +62,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detail-workers", type=int, default=DETAIL_WORKERS, help="상세 보강 동시 요청 수")
     parser.add_argument("--detail-timeout", type=float, default=DETAIL_TIMEOUT, help="상세 보강 타임아웃(초)")
     parser.add_argument("--detail-retries", type=int, default=2, help="상세 보강 재시도 횟수")
+    parser.add_argument(
+        "--detail-proxy-pool",
+        default=os.environ.get(DETAIL_PROXY_POOL_ENV, ""),
+        help="상세 보강 HTTP 요청에만 적용할 프록시 풀(쉼표 구분, worker-affinity)",
+    )
     parser.add_argument("--seed-limit", type=int, default=5000, help="랭킹 테이블에서 바로 승격할 최대 goods_no 수")
     parser.add_argument("--retry-base-minutes", type=int, default=30, help="실패 재시도 기본 간격(분)")
     parser.add_argument("--max-retry-count", type=int, default=12, help="재시도 최대 횟수")
+    parser.add_argument(
+        "--skip-retry-queue",
+        action="store_true",
+        default=False,
+        help="재시도 큐를 건너뛰고 최근 랭킹의 신규 goods_no만 상세 보강",
+    )
     parser.add_argument("--page-timeout-ms", type=int, default=45000, help="쿠키 부트스트랩 페이지 타임아웃")
     parser.add_argument("--bootstrap-url", default=DEFAULT_BOOTSTRAP_URL, help="CF 쿠키 부트스트랩용 URL")
     parser.add_argument("--browser-profile-dir", default=".browser_profile_camoufox", help="Camoufox 프로필 디렉토리")
+    parser.add_argument(
+        "--disable-rescue-pass",
+        action="store_true",
+        default=False,
+        help="실패 goods_no에 대한 추가 rescue pass를 수행하지 않음",
+    )
+    parser.add_argument(
+        "--rescue-workers",
+        type=int,
+        default=1,
+        help="실패 goods_no rescue pass 동시 요청 수",
+    )
+    parser.add_argument(
+        "--rescue-retries",
+        type=int,
+        default=1,
+        help="실패 goods_no rescue pass 재시도 횟수",
+    )
     parser.add_argument("--dry-run", action="store_true", default=False, help="BQ 쓰기 없이 후보/성공 건수만 출력")
     return parser.parse_args()
 
@@ -133,8 +164,44 @@ def fetch_candidates(
     lookback_hours: int,
     limit: int,
     max_retry_count: int,
+    *,
+    skip_retry_queue: bool = False,
 ) -> list[dict[str, Any]]:
-    query = f"""
+    if skip_retry_queue:
+        query = f"""
+        WITH recent_ranking AS (
+          SELECT
+            goods_no,
+            ARRAY_AGG(
+              STRUCT(detail_url, brand_name, product_name, collected_at)
+              ORDER BY collected_at DESC LIMIT 1
+            )[OFFSET(0)] AS latest,
+            MIN(collected_at) AS first_seen_at,
+            MAX(collected_at) AS last_seen_at
+          FROM `{RANKING_TABLE_ID}`
+          WHERE goods_no IS NOT NULL
+            AND goods_no != ''
+            AND collected_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @lookback_hours HOUR)
+          GROUP BY goods_no
+        )
+        SELECT
+          r.goods_no,
+          r.latest.detail_url AS detail_url,
+          r.latest.brand_name AS brand_name,
+          r.latest.product_name AS product_name,
+          r.first_seen_at,
+          r.first_seen_at AS first_queued_at,
+          r.last_seen_at,
+          0 AS retry_count,
+          'NEW' AS candidate_type
+        FROM recent_ranking r
+        LEFT JOIN `{IDENTITY_TABLE_ID}` i USING (goods_no)
+        WHERE i.goods_no IS NULL
+        ORDER BY r.last_seen_at DESC
+        LIMIT @limit
+        """
+    else:
+        query = f"""
     WITH recent_ranking AS (
       SELECT
         goods_no,
@@ -533,6 +600,52 @@ def build_retry_rows(
     return rows
 
 
+def rescue_failed_enrichment(
+    candidates: list[dict[str, Any]],
+    enrichment_map: dict[str, dict[str, Any]],
+    *,
+    bootstrap_url: str,
+    page_timeout_ms: int,
+    browser_profile_dir: str,
+    detail_workers: int,
+    detail_timeout: float,
+    detail_retries: int,
+    detail_proxy_pool: list[str],
+) -> dict[str, dict[str, Any]]:
+    failed_candidates = [
+        candidate
+        for candidate in candidates
+        if not is_success(enrichment_map.get(candidate["goods_no"]) or {})
+    ]
+    if not failed_candidates:
+        return {}
+
+    goods_nos = [candidate["goods_no"] for candidate in failed_candidates]
+    detail_url_map = {
+        candidate["goods_no"]: candidate.get("detail_url")
+        for candidate in failed_candidates
+        if candidate.get("detail_url")
+    }
+    rescue_profile_dir = f"{browser_profile_dir}_rescue"
+    rescue_cookies = bootstrap_cookies(bootstrap_url, page_timeout_ms, rescue_profile_dir)
+    print(
+        f"[INFO] identity rescue 후보: {len(failed_candidates)}건 "
+        f"(workers={detail_workers}, retries={detail_retries}, cookies={len(rescue_cookies)})"
+    )
+    rescue_map = fetch_detail_enrichment_http(
+        goods_nos,
+        detail_urls=detail_url_map,
+        playwright_cookies=rescue_cookies,
+        proxy_pool=detail_proxy_pool,
+        max_workers=max(1, detail_workers),
+        timeout=detail_timeout,
+        retries=detail_retries,
+    )
+    rescued_count = len([payload for payload in rescue_map.values() if is_success(payload)])
+    print(f"[INFO] identity rescue 성공: {rescued_count}/{len(failed_candidates)}건")
+    return rescue_map
+
+
 def merge_rows(
     client: bigquery.Client,
     table_id: str,
@@ -590,6 +703,7 @@ def merge_rows(
 def main() -> None:
     args = parse_args()
     client = get_bq_client()
+    detail_proxy_pool = parse_proxy_pool(args.detail_proxy_pool)
     seed_candidates = fetch_seed_rows(client, args.lookback_hours, args.seed_limit)
     seed_rows = build_seed_identity_rows(seed_candidates)
     print(f"[INFO] ranking seed 후보: {len(seed_candidates)}건")
@@ -599,7 +713,13 @@ def main() -> None:
         seeded_count = merge_rows(client, IDENTITY_TABLE_ID, seed_rows)
         print(f"[INFO] ranking seed upsert 완료: {seeded_count}건")
 
-    candidates = fetch_candidates(client, args.lookback_hours, args.limit, args.max_retry_count)
+    candidates = fetch_candidates(
+        client,
+        args.lookback_hours,
+        args.limit,
+        args.max_retry_count,
+        skip_retry_queue=args.skip_retry_queue,
+    )
     if not candidates:
         print("[INFO] 보강 대상 goods_no 없음")
         return
@@ -619,10 +739,27 @@ def main() -> None:
         goods_nos,
         detail_urls=detail_url_map,
         playwright_cookies=cookies,
+        proxy_pool=detail_proxy_pool,
         max_workers=args.detail_workers,
         timeout=args.detail_timeout,
         retries=args.detail_retries,
     )
+
+    if not args.disable_rescue_pass:
+        rescue_map = rescue_failed_enrichment(
+            candidates,
+            enrichment_map,
+            bootstrap_url=args.bootstrap_url,
+            page_timeout_ms=args.page_timeout_ms,
+            browser_profile_dir=args.browser_profile_dir,
+            detail_workers=args.rescue_workers,
+            detail_timeout=args.detail_timeout,
+            detail_retries=args.rescue_retries,
+            detail_proxy_pool=detail_proxy_pool,
+        )
+        for goods_no, payload in rescue_map.items():
+            if is_success(payload):
+                enrichment_map[goods_no] = payload
 
     enriched_at = now_iso()
     identity_rows = build_identity_rows(candidates, enrichment_map, enriched_at)

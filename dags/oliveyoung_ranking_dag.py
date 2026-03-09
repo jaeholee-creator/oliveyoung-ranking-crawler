@@ -24,9 +24,24 @@ CATEGORY_ROWS = int(Variable.get("oliveyoung_category_rows", default_var="100"))
 REVIEW_WORKERS = int(Variable.get("oliveyoung_review_workers", default_var="18"))
 REVIEW_RETRIES = int(Variable.get("oliveyoung_review_retries", default_var="3"))
 REVIEW_TIMEOUT = float(Variable.get("oliveyoung_review_timeout", default_var="10"))
+REVIEW_PROXY_POOL = Variable.get("oliveyoung_review_proxy_pool", default_var="")
 DETAIL_WORKERS = int(Variable.get("oliveyoung_detail_workers", default_var="6"))
 DETAIL_RETRIES = int(Variable.get("oliveyoung_detail_retries", default_var="2"))
 DETAIL_TIMEOUT = float(Variable.get("oliveyoung_detail_timeout", default_var="15"))
+DETAIL_PROXY_POOL = Variable.get("oliveyoung_detail_proxy_pool", default_var="")
+RANKING_DETAIL_LOOKBACK_HOURS = int(Variable.get("oliveyoung_ranking_detail_lookback_hours", default_var="6"))
+RANKING_DETAIL_LIMIT = int(Variable.get("oliveyoung_ranking_detail_limit", default_var="2500"))
+RANKING_DETAIL_ENRICH_TIMEOUT_MINUTES = int(
+    Variable.get("oliveyoung_ranking_detail_enrich_timeout_minutes", default_var="30")
+)
+RANKING_DETAIL_SYNC_LOOKBACK_HOURS = int(
+    Variable.get("oliveyoung_ranking_detail_sync_lookback_hours", default_var=str(RANKING_DETAIL_LOOKBACK_HOURS))
+)
+RANKING_DETAIL_SYNC_TIMEOUT_MINUTES = int(
+    Variable.get("oliveyoung_ranking_detail_sync_timeout_minutes", default_var="10")
+)
+IDENTITY_RETRY_BASE_MINUTES = int(Variable.get("oliveyoung_identity_retry_base_minutes", default_var="30"))
+IDENTITY_MAX_RETRY_COUNT = int(Variable.get("oliveyoung_identity_max_retry_count", default_var="12"))
 CATEGORY_RETRIES = int(Variable.get("oliveyoung_category_retries", default_var="2"))
 PAGE_TIMEOUT_MS = int(Variable.get("oliveyoung_page_timeout_ms", default_var="45000"))
 CATEGORY_SCROLL_ATTEMPTS = int(Variable.get("oliveyoung_category_scroll_attempts", default_var="3"))
@@ -51,6 +66,8 @@ TARGET_URL = (
 
 # 최소 수집 건수 (미달 시 크롤러가 exit 1 → Airflow가 retry)
 MIN_ROWS = 2100
+
+DETAIL_ARGS = "--skip-detail-enrichment "
 
 
 def _send_slack_alert(channel, token, blocks, fallback_text):
@@ -153,9 +170,7 @@ crawl_ranking = BashOperator(
         f"--review-workers {REVIEW_WORKERS} "
         f"--review-retries {REVIEW_RETRIES} "
         f"--review-timeout {REVIEW_TIMEOUT} "
-        f"--detail-workers {DETAIL_WORKERS} "
-        f"--detail-retries {DETAIL_RETRIES} "
-        f"--detail-timeout {DETAIL_TIMEOUT} "
+        f"{DETAIL_ARGS}"
         f"--category-retries {CATEGORY_RETRIES} "
         f"--page-timeout-ms {PAGE_TIMEOUT_MS} "
         f"--category-scroll-attempts {CATEGORY_SCROLL_ATTEMPTS} "
@@ -164,6 +179,10 @@ crawl_ranking = BashOperator(
         f"--review-cache-max-entries {REVIEW_CACHE_MAX_ENTRIES} "
         f"--out-dir output/ranking_playwright"
     ),
+    env={
+        "OLIVEYOUNG_REVIEW_PROXY_POOL": REVIEW_PROXY_POOL,
+        "OLIVEYOUNG_DETAIL_PROXY_POOL": DETAIL_PROXY_POOL,
+    },
     execution_timeout=timedelta(minutes=CRAWL_TIMEOUT_MINUTES),
     dag=dag,
 )
@@ -248,6 +267,57 @@ load_to_bq = PythonOperator(
     task_id="load_to_bigquery",
     python_callable=_load_latest_to_bigquery,
     execution_timeout=timedelta(minutes=5),
+    dag=dag,
+)
+
+
+ensure_identity_tables = BashOperator(
+    task_id="ensure_identity_tables",
+    bash_command=(
+        f"cd {PROJECT_DIR} && "
+        f"export GOOGLE_APPLICATION_CREDENTIALS={GCP_KEY_PATH} && "
+        f"{PYTHON_BIN} bq/create_product_identity_tables.py --migrate"
+    ),
+    execution_timeout=timedelta(minutes=5),
+    dag=dag,
+)
+
+
+enrich_ranking_detail = BashOperator(
+    task_id="enrich_ranking_detail",
+    bash_command=(
+        f"export DISPLAY=:99 && "
+        f"export PYTHONUNBUFFERED=1 && "
+        f"cd {PROJECT_DIR} && "
+        f"export GOOGLE_APPLICATION_CREDENTIALS={GCP_KEY_PATH} && "
+        f"{PYTHON_BIN} scripts/enrich_product_identity.py "
+        f"--lookback-hours {RANKING_DETAIL_LOOKBACK_HOURS} "
+        f"--limit {RANKING_DETAIL_LIMIT} "
+        f"--detail-workers {DETAIL_WORKERS} "
+        f"--detail-retries {DETAIL_RETRIES} "
+        f"--detail-timeout {DETAIL_TIMEOUT} "
+        f"--retry-base-minutes {IDENTITY_RETRY_BASE_MINUTES} "
+        f"--max-retry-count {IDENTITY_MAX_RETRY_COUNT} "
+        f"--browser-profile-dir .browser_profile_ranking_detail "
+        f"--skip-retry-queue"
+    ),
+    env={
+        "OLIVEYOUNG_DETAIL_PROXY_POOL": DETAIL_PROXY_POOL,
+    },
+    execution_timeout=timedelta(minutes=RANKING_DETAIL_ENRICH_TIMEOUT_MINUTES),
+    dag=dag,
+)
+
+
+sync_ranking_detail = BashOperator(
+    task_id="sync_ranking_detail",
+    bash_command=(
+        f"cd {PROJECT_DIR} && "
+        f"export GOOGLE_APPLICATION_CREDENTIALS={GCP_KEY_PATH} && "
+        f"{PYTHON_BIN} scripts/sync_ranking_detail_from_identity.py "
+        f"--lookback-hours {RANKING_DETAIL_SYNC_LOOKBACK_HOURS}"
+    ),
+    execution_timeout=timedelta(minutes=RANKING_DETAIL_SYNC_TIMEOUT_MINUTES),
     dag=dag,
 )
 
@@ -417,5 +487,5 @@ brand_ranking_report = PythonOperator(
     dag=dag,
 )
 
-# 파이프라인: 크롤링 → BigQuery 적재 → 정리 → 수집완료 알림 → 브랜드 랭킹 변동 리포트
-crawl_ranking >> load_to_bq >> cleanup >> notify_slack >> brand_ranking_report
+# 파이프라인: 랭킹/리뷰 수집 → BigQuery 적재 → identity 상세 보강 → 랭킹 상세 동기화 → 정리/알림
+crawl_ranking >> load_to_bq >> ensure_identity_tables >> enrich_ranking_detail >> sync_ranking_detail >> cleanup >> notify_slack >> brand_ranking_report

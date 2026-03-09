@@ -18,6 +18,7 @@ IDENTITY_LIMIT = int(Variable.get("oliveyoung_identity_limit", default_var="300"
 IDENTITY_DETAIL_WORKERS = int(Variable.get("oliveyoung_identity_detail_workers", default_var="6"))
 IDENTITY_DETAIL_RETRIES = int(Variable.get("oliveyoung_identity_detail_retries", default_var="2"))
 IDENTITY_DETAIL_TIMEOUT = float(Variable.get("oliveyoung_identity_detail_timeout", default_var="15"))
+IDENTITY_DETAIL_PROXY_POOL = Variable.get("oliveyoung_identity_detail_proxy_pool", default_var="")
 IDENTITY_RETRY_BASE_MINUTES = int(Variable.get("oliveyoung_identity_retry_base_minutes", default_var="30"))
 IDENTITY_MAX_RETRY_COUNT = int(Variable.get("oliveyoung_identity_max_retry_count", default_var="12"))
 IDENTITY_TIMEOUT_MINUTES = int(Variable.get("oliveyoung_identity_timeout_minutes", default_var="25"))
@@ -66,9 +67,13 @@ enrich_identity = BashOperator(
         f"--detail-workers {IDENTITY_DETAIL_WORKERS} "
         f"--detail-retries {IDENTITY_DETAIL_RETRIES} "
         f"--detail-timeout {IDENTITY_DETAIL_TIMEOUT} "
+        f"--browser-profile-dir .browser_profile_identity "
         f"--retry-base-minutes {IDENTITY_RETRY_BASE_MINUTES} "
         f"--max-retry-count {IDENTITY_MAX_RETRY_COUNT}"
     ),
+    env={
+        "OLIVEYOUNG_DETAIL_PROXY_POOL": IDENTITY_DETAIL_PROXY_POOL,
+    },
     execution_timeout=timedelta(minutes=IDENTITY_TIMEOUT_MINUTES),
     dag=dag,
 )

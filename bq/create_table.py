@@ -189,13 +189,15 @@ def create_table():
         print(f"  {field.name:25s} {field.field_type:10s} {field.mode:10s} | {field.description}")
 
 
-def migrate_schema():
-    """기존 테이블에 새 컬럼 추가 (비파괴적)."""
+def migrate_schema(*, prune_extra_columns: bool = False):
+    """기존 테이블 스키마를 기대 스키마에 맞춘다."""
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = SERVICE_ACCOUNT_KEY
     client = bigquery.Client(project=PROJECT_ID)
     table = client.get_table(FULL_TABLE_ID)
-    existing_names = {f.name for f in table.schema}
-    new_fields = [f for f in get_schema() if f.name not in existing_names]
+    expected_schema = get_schema()
+    expected_names = {field.name for field in expected_schema}
+    existing_names = {field.name for field in table.schema}
+    new_fields = [field for field in expected_schema if field.name not in existing_names]
     if new_fields:
         table.schema = list(table.schema) + new_fields
         client.update_table(table, ["schema"])
@@ -203,13 +205,34 @@ def migrate_schema():
     else:
         print("스키마 변경 없음")
 
+    if not prune_extra_columns:
+        return
+
+    extra_fields = [
+        field.name
+        for field in client.get_table(FULL_TABLE_ID).schema
+        if field.name not in expected_names
+    ]
+    if not extra_fields:
+        print("삭제할 불필요 컬럼 없음")
+        return
+
+    for field_name in extra_fields:
+        client.query(f"ALTER TABLE `{FULL_TABLE_ID}` DROP COLUMN {field_name}").result()
+        print(f"불필요 컬럼 삭제: {field_name}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="올리브영 랭킹 BigQuery 테이블 관리")
     parser.add_argument("--migrate", action="store_true", help="기존 테이블에 새 컬럼 추가")
+    parser.add_argument(
+        "--prune-extra-columns",
+        action="store_true",
+        help="기대 스키마에 없는 컬럼을 BigQuery 테이블에서 제거",
+    )
     args = parser.parse_args()
 
     if args.migrate:
-        migrate_schema()
+        migrate_schema(prune_extra_columns=args.prune_extra_columns)
     else:
         create_table()

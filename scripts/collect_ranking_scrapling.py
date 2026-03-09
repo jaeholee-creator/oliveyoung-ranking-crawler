@@ -58,6 +58,8 @@ REVIEW_CACHE_MAX_ENTRIES = 30000
 DETAIL_WORKERS = 6
 DETAIL_RETRIES = 2
 DETAIL_TIMEOUT = 15.0
+REVIEW_PROXY_POOL_ENV = "OLIVEYOUNG_REVIEW_PROXY_POOL"
+DETAIL_PROXY_POOL_ENV = "OLIVEYOUNG_DETAIL_PROXY_POOL"
 
 
 DEFAULT_CATEGORIES = [
@@ -118,9 +120,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--review-workers", type=int, default=REVIEW_WORKERS, help="리뷰 API 동시 요청 수")
     parser.add_argument("--review-retries", type=int, default=REVIEW_RETRIES, help="리뷰 API 재시도 횟수")
     parser.add_argument("--review-timeout", type=float, default=REVIEW_TIMEOUT, help="리뷰 API 타임아웃(초)")
+    parser.add_argument(
+        "--review-proxy-pool",
+        default=os.environ.get(REVIEW_PROXY_POOL_ENV, ""),
+        help="리뷰 API에만 적용할 프록시 풀(쉼표 구분, worker-affinity)",
+    )
     parser.add_argument("--detail-workers", type=int, default=DETAIL_WORKERS, help="상세/extra API 동시 요청 수")
     parser.add_argument("--detail-retries", type=int, default=DETAIL_RETRIES, help="상세/extra API 재시도 횟수")
     parser.add_argument("--detail-timeout", type=float, default=DETAIL_TIMEOUT, help="상세/extra API 타임아웃(초)")
+    parser.add_argument(
+        "--detail-proxy-pool",
+        default=os.environ.get(DETAIL_PROXY_POOL_ENV, ""),
+        help="상세/extra/QnA API에만 적용할 프록시 풀(쉼표 구분, worker-affinity)",
+    )
+    parser.add_argument(
+        "--skip-detail-enrichment",
+        action="store_true",
+        default=False,
+        help="상세/extra/QnA 메타 수집을 스킵하고 랭킹/리뷰 수집만 수행",
+    )
     parser.add_argument("--category-sort-by-page", action="store_true", default=False, help="추출된 버튼 순서 대신 기본 카테고리 순서 사용")
     parser.add_argument(
         "--category-rows",
@@ -204,6 +222,32 @@ def to_csv(rows: list[dict], headers: list[str]) -> str:
     for row in rows:
         lines.append(",".join(escape_csv_field(row.get(h)) for h in headers))
     return "\n".join(lines) + "\n"
+
+
+def parse_proxy_pool(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return []
+    proxies: list[str] = []
+    for item in re.split(r"[\s,]+", raw_value.strip()):
+        proxy = item.strip()
+        if proxy and proxy not in proxies:
+            proxies.append(proxy)
+    return proxies
+
+
+def _pick_proxy(proxy_pool: list[str], worker_id: int) -> str | None:
+    if not proxy_pool:
+        return None
+    return proxy_pool[worker_id % len(proxy_pool)]
+
+
+def _apply_proxy_to_session(session: Any, proxy_url: str | None) -> None:
+    if not proxy_url:
+        return
+    session.proxies.update({
+        "http": proxy_url,
+        "https": proxy_url,
+    })
 
 
 def load_review_cache(cache_path: Path, ttl_hours: float, max_entries: int) -> dict[str, dict[str, Any]]:
@@ -828,17 +872,25 @@ def _build_detail_enrichment_payload(
 _detail_threads = threading.local()
 
 
-def _get_detail_session(cffi_requests: Any, browser: str, supports_impersonate: bool, cookies: dict[str, str]):
+def _get_detail_session(
+    cffi_requests: Any,
+    browser: str,
+    supports_impersonate: bool,
+    cookies: dict[str, str],
+    proxy_url: str | None = None,
+):
     sessions = getattr(_detail_threads, "sessions", None)
     if sessions is None:
         sessions = {}
         _detail_threads.sessions = sessions
-    if browser not in sessions:
+    session_key = (browser, proxy_url or "")
+    if session_key not in sessions:
         session = cffi_requests.Session(impersonate=browser) if supports_impersonate else cffi_requests.Session()
+        _apply_proxy_to_session(session, proxy_url)
         if cookies:
             session.cookies.update(cookies)
-        sessions[browser] = session
-    return sessions[browser]
+        sessions[session_key] = session
+    return sessions[session_key]
 
 
 def fetch_detail_enrichment_http(
@@ -846,6 +898,7 @@ def fetch_detail_enrichment_http(
     *,
     detail_urls: dict[str, str] | None = None,
     playwright_cookies: dict[str, str] | None = None,
+    proxy_pool: list[str] | None = None,
     max_workers: int = DETAIL_WORKERS,
     timeout: float = DETAIL_TIMEOUT,
     retries: int = DETAIL_RETRIES,
@@ -863,14 +916,24 @@ def fetch_detail_enrichment_http(
 
     detail_url_map = detail_urls or {}
     base_cookies = playwright_cookies or {}
+    normalized_proxy_pool = proxy_pool or []
     print(
         f"[INFO] 상세 메타 수집: {len(unique_nos)}건 "
         f"(workers={max_workers}, timeout={timeout}, retries={retries})"
     )
+    if normalized_proxy_pool:
+        print(f"[INFO] 상세 프록시 풀 사용: {len(normalized_proxy_pool)}개")
 
     def _fetch_one(gno: str, worker_id: int) -> tuple[str, dict[str, Any]]:
         browser = _pick_browser(worker_id)
-        session = _get_detail_session(cffi_requests, browser, supports_impersonate, base_cookies)
+        proxy_url = _pick_proxy(normalized_proxy_pool, worker_id)
+        session = _get_detail_session(
+            cffi_requests,
+            browser,
+            supports_impersonate,
+            base_cookies,
+            proxy_url=proxy_url,
+        )
         html_headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -990,15 +1053,18 @@ def _pick_browser(user_no: int) -> str:
 _review_threads = threading.local()
 
 
-def _get_review_session(cffi_requests: Any, browser: str):
+def _get_review_session(cffi_requests: Any, browser: str, proxy_url: str | None = None):
     """Thread-local cffi session 캐시로 동일 스레드 재요청 비용을 줄인다."""
     sessions = getattr(_review_threads, "sessions", None)
     if sessions is None:
         sessions = {}
         _review_threads.sessions = sessions
-    if browser not in sessions:
-        sessions[browser] = cffi_requests.Session(impersonate=browser)
-    return sessions[browser]
+    session_key = (browser, proxy_url or "")
+    if session_key not in sessions:
+        session = cffi_requests.Session(impersonate=browser)
+        _apply_proxy_to_session(session, proxy_url)
+        sessions[session_key] = session
+    return sessions[session_key]
 
 
 def _parse_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1114,6 +1180,7 @@ def _review_backoff(attempt: int) -> float:
 def fetch_review_stats_http(
     goods_nos: list[str],
     *,
+    proxy_pool: list[str] | None = None,
     max_workers: int = REVIEW_WORKERS,
     timeout: float = REVIEW_TIMEOUT,
     retries: int = REVIEW_RETRIES,
@@ -1126,22 +1193,29 @@ def fetch_review_stats_http(
         import requests as cffi_requests
         supports_impersonate = False
 
-    def _new_session(browser: str):
+    def _new_session(browser: str, proxy_url: str | None = None):
         if supports_impersonate:
-            return cffi_requests.Session(impersonate=browser)
-        return cffi_requests.Session()
+            session = cffi_requests.Session(impersonate=browser)
+        else:
+            session = cffi_requests.Session()
+        _apply_proxy_to_session(session, proxy_url)
+        return session
 
     unique_nos = list(dict.fromkeys([x for x in goods_nos if x]))
     if not unique_nos:
         return {}
+    normalized_proxy_pool = proxy_pool or []
 
     print(
         f"[INFO] 리뷰 API 병렬 수집: {len(unique_nos)}건 "
         f"(workers={max_workers}, timeout={timeout}, retries={retries})"
     )
+    if normalized_proxy_pool:
+        print(f"[INFO] 리뷰 프록시 풀 사용: {len(normalized_proxy_pool)}개")
 
     def _fetch_one(gno: str, worker_id: int) -> tuple[str, dict[str, Any] | None]:
         browser = _pick_browser(worker_id)
+        proxy_url = _pick_proxy(normalized_proxy_pool, worker_id)
         url = REVIEW_API.format(goods_no=gno)
         alt_url = f"{ALT_REVIEW_API}?product-id={gno}"
         headers = {
@@ -1159,9 +1233,9 @@ def fetch_review_stats_http(
             "sec-ch-ua-platform": '"iOS"',
         }
         if supports_impersonate:
-            session = _get_review_session(cffi_requests, browser)
+            session = _get_review_session(cffi_requests, browser, proxy_url=proxy_url)
         else:
-            session = _new_session(browser)
+            session = _new_session(browser, proxy_url=proxy_url)
 
         for attempt in range(1, retries + 1):
             try:
@@ -1305,6 +1379,8 @@ def run() -> None:
     out_dir = Path(os.getcwd()) / args.out_dir / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     playwright_cookies: dict[str, str] = {}
+    review_proxy_pool = parse_proxy_pool(args.review_proxy_pool)
+    detail_proxy_pool = parse_proxy_pool(args.detail_proxy_pool)
 
     if args.review_only:
         print("[INFO] review-only 모드: 카테고리 수집 없이 리뷰 API만 호출")
@@ -1322,6 +1398,7 @@ def run() -> None:
 
         review_stats = fetch_review_stats_http(
             goods_raw,
+            proxy_pool=review_proxy_pool,
             max_workers=args.review_workers,
             timeout=args.review_timeout,
             retries=args.review_retries,
@@ -1768,14 +1845,19 @@ def run() -> None:
         for row in rows
         if row.get("goods_no") and row.get("detail_url")
     }
-    detail_enrichment = fetch_detail_enrichment_http(
-        unique_goods_nos,
-        detail_urls=detail_url_map,
-        playwright_cookies=playwright_cookies,
-        max_workers=args.detail_workers,
-        timeout=args.detail_timeout,
-        retries=args.detail_retries,
-    )
+    if args.skip_detail_enrichment:
+        print("[INFO] 상세 메타 수집 스킵: 랭킹 경량 수집 모드")
+        detail_enrichment = {}
+    else:
+        detail_enrichment = fetch_detail_enrichment_http(
+            unique_goods_nos,
+            detail_urls=detail_url_map,
+            playwright_cookies=playwright_cookies,
+            proxy_pool=detail_proxy_pool,
+            max_workers=args.detail_workers,
+            timeout=args.detail_timeout,
+            retries=args.detail_retries,
+        )
     print(f"[INFO] 리뷰 통계 조회: {len(unique_goods_nos)}개 상품")
 
     review_total = len(unique_goods_nos)
@@ -1794,6 +1876,7 @@ def run() -> None:
     if missing_review_goods:
         remote_review_stats = fetch_review_stats_http(
             missing_review_goods,
+            proxy_pool=review_proxy_pool,
             max_workers=args.review_workers,
             timeout=args.review_timeout,
             retries=args.review_retries,
