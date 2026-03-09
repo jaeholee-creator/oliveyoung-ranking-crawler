@@ -12,8 +12,8 @@ from google.oauth2 import service_account
 
 PROJECT_ID = "member-378109"
 DATASET_ID = "jaeho"
-RANKING_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking"
-IDENTITY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_identity"
+RANKING_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_history"
+IDENTITY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_details"
 
 KEY_PATH = os.environ.get(
     "GOOGLE_APPLICATION_CREDENTIALS",

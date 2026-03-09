@@ -15,12 +15,12 @@ SERVICE_ACCOUNT_KEY = os.environ.get(
 
 PROJECT_ID = "member-378109"
 DATASET_ID = "jaeho"
-IDENTITY_TABLE_ID = "oliveyoung_product_identity"
-RETRY_TABLE_ID = "oliveyoung_product_identity_retry"
+IDENTITY_TABLE_ID = "oliveyoung_product_details"
+RETRY_TABLE_ID = "oliveyoung_product_detail_retry_queue"
 FULL_IDENTITY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.{IDENTITY_TABLE_ID}"
 FULL_RETRY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.{RETRY_TABLE_ID}"
-IDENTITY_TABLE_DESCRIPTION = "올리브영 상품 식별 정보 및 canonical_product_id 브리지"
-RETRY_TABLE_DESCRIPTION = "올리브영 상품 식별 재시도 큐"
+IDENTITY_TABLE_DESCRIPTION = "올리브영 상품 상세 최신 스냅샷 테이블"
+RETRY_TABLE_DESCRIPTION = "올리브영 상품 상세 수집 재시도 큐"
 
 
 def get_identity_schema() -> list[bigquery.SchemaField]:

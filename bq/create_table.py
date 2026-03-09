@@ -12,9 +12,9 @@ SERVICE_ACCOUNT_KEY = os.environ.get(
 
 PROJECT_ID = "member-378109"
 DATASET_ID = "jaeho"
-TABLE_ID = "oliveyoung_ranking"
+TABLE_ID = "oliveyoung_ranking_history"
 FULL_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-TABLE_DESCRIPTION = "올리브영 판매 랭킹 데이터 (30분 주기 수집)"
+TABLE_DESCRIPTION = "올리브영 판매 랭킹 히스토리 데이터 (매시 append 적재)"
 
 
 def get_schema():
@@ -233,21 +233,18 @@ def migrate_schema(*, prune_extra_columns: bool = False):
     else:
         print("스키마 변경 없음")
 
-    if not prune_extra_columns:
-        return
-
-    extra_fields = [
-        field.name
-        for field in client.get_table(FULL_TABLE_ID).schema
-        if field.name not in expected_names
-    ]
-    if not extra_fields:
-        print("삭제할 불필요 컬럼 없음")
-        return
-
-    for field_name in extra_fields:
-        client.query(f"ALTER TABLE `{FULL_TABLE_ID}` DROP COLUMN {field_name}").result()
-        print(f"불필요 컬럼 삭제: {field_name}")
+    if prune_extra_columns:
+        extra_fields = [
+            field.name
+            for field in client.get_table(FULL_TABLE_ID).schema
+            if field.name not in expected_names
+        ]
+        if not extra_fields:
+            print("삭제할 불필요 컬럼 없음")
+        else:
+            for field_name in extra_fields:
+                client.query(f"ALTER TABLE `{FULL_TABLE_ID}` DROP COLUMN {field_name}").result()
+                print(f"불필요 컬럼 삭제: {field_name}")
 
     _sync_schema_metadata(
         client,

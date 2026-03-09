@@ -40,9 +40,9 @@ from collect_ranking_scrapling import (  # noqa: E402
 
 PROJECT_ID = "member-378109"
 DATASET_ID = "jaeho"
-RANKING_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking"
-IDENTITY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_identity"
-RETRY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_identity_retry"
+RANKING_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_history"
+IDENTITY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_details"
+RETRY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_detail_retry_queue"
 DEFAULT_TARGET_URL = "https://www.oliveyoung.co.kr/store/main/getBestList.do"
 DEFAULT_BOOTSTRAP_URL = (
     "https://www.oliveyoung.co.kr/store/main/getBestList.do?"

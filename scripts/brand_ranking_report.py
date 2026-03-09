@@ -21,7 +21,7 @@ from google.oauth2 import service_account
 
 PROJECT_ID = "member-378109"
 DATASET_ID = "jaeho"
-TABLE_ID = "oliveyoung_ranking"
+TABLE_ID = "oliveyoung_ranking_history"
 FULL_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
 KEY_PATH = os.environ.get(
