@@ -19,6 +19,8 @@ IDENTITY_TABLE_ID = "oliveyoung_product_identity"
 RETRY_TABLE_ID = "oliveyoung_product_identity_retry"
 FULL_IDENTITY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.{IDENTITY_TABLE_ID}"
 FULL_RETRY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.{RETRY_TABLE_ID}"
+IDENTITY_TABLE_DESCRIPTION = "올리브영 상품 식별 정보 및 canonical_product_id 브리지"
+RETRY_TABLE_DESCRIPTION = "올리브영 상품 식별 재시도 큐"
 
 
 def get_identity_schema() -> list[bigquery.SchemaField]:
@@ -140,7 +142,13 @@ def ensure_table(
             raise
 
 
-def migrate_table(client: bigquery.Client, full_table_id: str, schema: list[bigquery.SchemaField]) -> None:
+def migrate_table(
+    client: bigquery.Client,
+    full_table_id: str,
+    schema: list[bigquery.SchemaField],
+    *,
+    table_description: str,
+) -> None:
     table = client.get_table(full_table_id)
     existing_names = {field.name for field in table.schema}
     new_fields = [field for field in schema if field.name not in existing_names]
@@ -150,6 +158,24 @@ def migrate_table(client: bigquery.Client, full_table_id: str, schema: list[bigq
         print(f"스키마 업데이트: {full_table_id} -> {[field.name for field in new_fields]}")
     else:
         print(f"스키마 변경 없음: {full_table_id}")
+
+    table = client.get_table(full_table_id)
+    expected_by_name = {field.name: field for field in schema}
+    updated_schema = [expected_by_name.get(field.name, field) for field in table.schema]
+    schema_changed = any(
+        current.description != updated.description
+        for current, updated in zip(table.schema, updated_schema, strict=False)
+    ) or len(table.schema) != len(updated_schema)
+    if schema_changed:
+        table.schema = updated_schema
+        client.update_table(table, ["schema"])
+        print(f"스키마 설명 동기화: {full_table_id}")
+
+    table = client.get_table(full_table_id)
+    if table.description != table_description:
+        table.description = table_description
+        client.update_table(table, ["description"])
+        print(f"테이블 설명 동기화: {full_table_id}")
 
 
 def create_tables() -> None:
@@ -164,7 +190,7 @@ def create_tables() -> None:
         get_identity_schema(),
         partition_field="last_enriched_at",
         clustering_fields=["canonical_product_id", "goods_no", "item_id"],
-        description="올리브영 상품 식별 정보 및 canonical_product_id 브리지",
+        description=IDENTITY_TABLE_DESCRIPTION,
     )
     ensure_table(
         client,
@@ -173,15 +199,25 @@ def create_tables() -> None:
         get_retry_schema(),
         partition_field="next_retry_at",
         clustering_fields=["last_status", "goods_no"],
-        description="올리브영 상품 식별 재시도 큐",
+        description=RETRY_TABLE_DESCRIPTION,
     )
 
 
 def migrate_tables() -> None:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = SERVICE_ACCOUNT_KEY
     client = bigquery.Client(project=PROJECT_ID)
-    migrate_table(client, FULL_IDENTITY_TABLE_ID, get_identity_schema())
-    migrate_table(client, FULL_RETRY_TABLE_ID, get_retry_schema())
+    migrate_table(
+        client,
+        FULL_IDENTITY_TABLE_ID,
+        get_identity_schema(),
+        table_description=IDENTITY_TABLE_DESCRIPTION,
+    )
+    migrate_table(
+        client,
+        FULL_RETRY_TABLE_ID,
+        get_retry_schema(),
+        table_description=RETRY_TABLE_DESCRIPTION,
+    )
 
 
 if __name__ == "__main__":

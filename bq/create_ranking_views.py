@@ -7,6 +7,9 @@ import os
 
 from google.cloud import bigquery
 
+from create_product_identity_tables import get_identity_schema, get_retry_schema
+from create_table import get_schema as get_ranking_schema
+
 SERVICE_ACCOUNT_KEY = os.environ.get(
     "GOOGLE_APPLICATION_CREDENTIALS",
     os.path.expanduser("~/Downloads/target-378109-7f1aa3e0dc9a.json"),
@@ -19,6 +22,8 @@ IDENTITY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_identity"
 RETRY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_identity_retry"
 FINAL_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_final_view"
 GAP_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_detail_gap_view"
+FINAL_VIEW_DESCRIPTION = "올리브영 최신 논리 배치 기준 랭킹+상세 통합 조회 뷰"
+GAP_VIEW_DESCRIPTION = "올리브영 최신 논리 배치 기준 상세 누락 상품 진단 뷰"
 
 DETAIL_ENRICHED_EXPR = """
 (
@@ -210,6 +215,56 @@ WHERE NOT detail_enriched
 """
 
 
+def get_view_field_descriptions() -> dict[str, str]:
+    descriptions = {field.name: field.description for field in get_ranking_schema()}
+    descriptions.update(
+        {
+            "batch_started_at": "최신 논리 배치의 시작 시각(UTC, 분 단위)",
+            "batch_ended_at": "최신 논리 배치의 종료 시각(UTC, 분 단위)",
+            "identity_confidence": "상세 보강 결과의 식별자 신뢰도(HIGH/MEDIUM/LOW/NONE)",
+            "identity_last_status": "상품 식별 보강 테이블 기준 마지막 상태",
+            "last_enriched_at": "마지막 상세 보강 성공 시각",
+            "retry_count": "상세 보강 재시도 누적 횟수",
+            "retry_last_status": "재시도 큐 기준 마지막 상태",
+            "retry_last_error": "재시도 큐 기준 마지막 실패 원인",
+            "retry_last_attempt_at": "재시도 큐 기준 마지막 시도 시각",
+            "retry_next_retry_at": "재시도 큐 기준 다음 재시도 예정 시각",
+            "detail_enriched": "최종 조회 기준 상세 정보 존재 여부",
+            "detail_status": "최종 조회 기준 상세 상태(ENRICHED/RETRY_PENDING/RESOLVED/MISSING)",
+        }
+    )
+
+    identity_desc = {field.name: field.description for field in get_identity_schema()}
+    retry_desc = {field.name: field.description for field in get_retry_schema()}
+    descriptions["identity_confidence"] = identity_desc["identity_confidence"]
+    descriptions["retry_count"] = retry_desc["retry_count"]
+    return descriptions
+
+
+def apply_view_metadata(
+    client: bigquery.Client,
+    view_id: str,
+    *,
+    description: str,
+    field_descriptions: dict[str, str],
+) -> None:
+    table = client.get_table(view_id)
+    updated_schema = [
+        bigquery.SchemaField(
+            field.name,
+            field.field_type,
+            mode=field.mode,
+            description=field_descriptions.get(field.name),
+            fields=field.fields,
+        )
+        for field in table.schema
+    ]
+    table.schema = updated_schema
+    table.description = description
+    client.update_table(table, ["schema", "description"])
+    print(f"view 메타데이터 동기화 완료: {view_id}")
+
+
 def get_client() -> bigquery.Client:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = SERVICE_ACCOUNT_KEY
     return bigquery.Client(project=PROJECT_ID)
@@ -217,10 +272,23 @@ def get_client() -> bigquery.Client:
 
 def create_views() -> None:
     client = get_client()
+    field_descriptions = get_view_field_descriptions()
     client.query(FINAL_VIEW_SQL).result()
     print(f"view 생성 완료: {FINAL_VIEW_ID}")
+    apply_view_metadata(
+        client,
+        FINAL_VIEW_ID,
+        description=FINAL_VIEW_DESCRIPTION,
+        field_descriptions=field_descriptions,
+    )
     client.query(GAP_VIEW_SQL).result()
     print(f"view 생성 완료: {GAP_VIEW_ID}")
+    apply_view_metadata(
+        client,
+        GAP_VIEW_ID,
+        description=GAP_VIEW_DESCRIPTION,
+        field_descriptions=field_descriptions,
+    )
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ PROJECT_ID = "member-378109"
 DATASET_ID = "jaeho"
 TABLE_ID = "oliveyoung_ranking"
 FULL_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+TABLE_DESCRIPTION = "올리브영 판매 랭킹 데이터 (30분 주기 수집)"
 
 
 def get_schema():
@@ -172,7 +173,7 @@ def create_table():
     # 클러스터링: 자주 필터링하는 컬럼 기준
     table.clustering_fields = ["category_code", "brand_name"]
 
-    table.description = "올리브영 판매 랭킹 데이터 (30분 주기 수집)"
+    table.description = TABLE_DESCRIPTION
 
     try:
         created = client.create_table(table)
@@ -187,6 +188,33 @@ def create_table():
     print("\n=== 테이블 스키마 ===")
     for field in get_schema():
         print(f"  {field.name:25s} {field.field_type:10s} {field.mode:10s} | {field.description}")
+
+
+def _sync_schema_metadata(
+    client: bigquery.Client,
+    full_table_id: str,
+    expected_schema: list[bigquery.SchemaField],
+    *,
+    table_description: str,
+) -> None:
+    table = client.get_table(full_table_id)
+    expected_by_name = {field.name: field for field in expected_schema}
+    updated_schema = [expected_by_name.get(field.name, field) for field in table.schema]
+
+    schema_changed = any(
+        current.description != updated.description
+        for current, updated in zip(table.schema, updated_schema, strict=False)
+    ) or len(table.schema) != len(updated_schema)
+    if schema_changed:
+        table.schema = updated_schema
+        client.update_table(table, ["schema"])
+        print("스키마 설명 동기화 완료")
+
+    table = client.get_table(full_table_id)
+    if table.description != table_description:
+        table.description = table_description
+        client.update_table(table, ["description"])
+        print("테이블 설명 동기화 완료")
 
 
 def migrate_schema(*, prune_extra_columns: bool = False):
@@ -220,6 +248,13 @@ def migrate_schema(*, prune_extra_columns: bool = False):
     for field_name in extra_fields:
         client.query(f"ALTER TABLE `{FULL_TABLE_ID}` DROP COLUMN {field_name}").result()
         print(f"불필요 컬럼 삭제: {field_name}")
+
+    _sync_schema_metadata(
+        client,
+        FULL_TABLE_ID,
+        expected_schema,
+        table_description=TABLE_DESCRIPTION,
+    )
 
 
 if __name__ == "__main__":
