@@ -57,6 +57,9 @@ SLACK_BOT_TOKEN = Variable.get("slack_bot_token", default_var="")
 SLACK_CHANNEL_ID = Variable.get("slack_channel_id", default_var="C0ACH02BLG5")
 BRAND_REPORT_TARGETS = Variable.get("brand_report_targets", default_var="바이오던스").split(",")
 PYTHON_BIN = Variable.get("oliveyoung_python_bin", default_var="/home/ubuntu/airflow-venv/bin/python3")
+DETAIL_PIPELINE_TIMEOUT_MINUTES = (
+    RANKING_DETAIL_ENRICH_TIMEOUT_MINUTES + RANKING_DETAIL_SYNC_TIMEOUT_MINUTES + 5
+)
 
 TARGET_URL = (
     "https://www.oliveyoung.co.kr/store/main/getBestList.do?"
@@ -271,25 +274,14 @@ load_to_bq = PythonOperator(
 )
 
 
-ensure_identity_tables = BashOperator(
-    task_id="ensure_identity_tables",
-    bash_command=(
-        f"cd {PROJECT_DIR} && "
-        f"export GOOGLE_APPLICATION_CREDENTIALS={GCP_KEY_PATH} && "
-        f"{PYTHON_BIN} bq/create_product_identity_tables.py --migrate"
-    ),
-    execution_timeout=timedelta(minutes=5),
-    dag=dag,
-)
-
-
-enrich_ranking_detail = BashOperator(
-    task_id="enrich_ranking_detail",
+enrich_and_sync_detail = BashOperator(
+    task_id="enrich_and_sync_detail",
     bash_command=(
         f"export DISPLAY=:99 && "
         f"export PYTHONUNBUFFERED=1 && "
         f"cd {PROJECT_DIR} && "
         f"export GOOGLE_APPLICATION_CREDENTIALS={GCP_KEY_PATH} && "
+        f"{PYTHON_BIN} bq/create_product_identity_tables.py --migrate && "
         f"{PYTHON_BIN} scripts/enrich_product_identity.py "
         f"--lookback-hours {RANKING_DETAIL_LOOKBACK_HOURS} "
         f"--limit {RANKING_DETAIL_LIMIT} "
@@ -299,25 +291,14 @@ enrich_ranking_detail = BashOperator(
         f"--retry-base-minutes {IDENTITY_RETRY_BASE_MINUTES} "
         f"--max-retry-count {IDENTITY_MAX_RETRY_COUNT} "
         f"--browser-profile-dir .browser_profile_ranking_detail "
-        f"--skip-retry-queue"
+        f"--skip-retry-queue && "
+        f"{PYTHON_BIN} scripts/sync_ranking_detail_from_identity.py "
+        f"--lookback-hours {RANKING_DETAIL_SYNC_LOOKBACK_HOURS}"
     ),
     env={
         "OLIVEYOUNG_DETAIL_PROXY_POOL": DETAIL_PROXY_POOL,
     },
-    execution_timeout=timedelta(minutes=RANKING_DETAIL_ENRICH_TIMEOUT_MINUTES),
-    dag=dag,
-)
-
-
-sync_ranking_detail = BashOperator(
-    task_id="sync_ranking_detail",
-    bash_command=(
-        f"cd {PROJECT_DIR} && "
-        f"export GOOGLE_APPLICATION_CREDENTIALS={GCP_KEY_PATH} && "
-        f"{PYTHON_BIN} scripts/sync_ranking_detail_from_identity.py "
-        f"--lookback-hours {RANKING_DETAIL_SYNC_LOOKBACK_HOURS}"
-    ),
-    execution_timeout=timedelta(minutes=RANKING_DETAIL_SYNC_TIMEOUT_MINUTES),
+    execution_timeout=timedelta(minutes=DETAIL_PIPELINE_TIMEOUT_MINUTES),
     dag=dag,
 )
 
@@ -342,13 +323,6 @@ def _cleanup_old_runs(**context):
     print(f"정리 완료: {removed}개 디렉토리 삭제")
     return removed
 
-
-cleanup = PythonOperator(
-    task_id="cleanup_old_runs",
-    python_callable=_cleanup_old_runs,
-    execution_timeout=timedelta(minutes=2),
-    dag=dag,
-)
 
 def _send_slack_notification(**context):
     """문제 발생 시에만 Slack 알림 (정상 수행 시 스킵)"""
@@ -438,14 +412,6 @@ def _send_slack_notification(**context):
     print(f"Slack 알림 발송 완료: {issues}")
 
 
-notify_slack = PythonOperator(
-    task_id="notify_slack",
-    python_callable=_send_slack_notification,
-    execution_timeout=timedelta(minutes=1),
-    dag=dag,
-)
-
-
 def _send_brand_ranking_report(**context):
     """브랜드별 시간별 랭킹 변동을 BigQuery에서 조회해 Slack으로 발송"""
     if not SLACK_BOT_TOKEN:
@@ -479,13 +445,20 @@ def _send_brand_ranking_report(**context):
         except Exception as exc:
             print(f"[WARN] {brand} 리포트 처리 실패: {exc}")
 
+def _finalize_run(**context):
+    """실행 종료 후 정리, 알림, 브랜드 리포트를 순차 수행."""
+    removed = _cleanup_old_runs(**context)
+    _send_slack_notification(**context)
+    _send_brand_ranking_report(**context)
+    return {"removedDirs": removed}
 
-brand_ranking_report = PythonOperator(
-    task_id="brand_ranking_report",
-    python_callable=_send_brand_ranking_report,
-    execution_timeout=timedelta(minutes=2),
+
+finalize_run = PythonOperator(
+    task_id="finalize_run",
+    python_callable=_finalize_run,
+    execution_timeout=timedelta(minutes=5),
     dag=dag,
 )
 
-# 파이프라인: 랭킹/리뷰 수집 → BigQuery 적재 → identity 상세 보강 → 랭킹 상세 동기화 → 정리/알림
-crawl_ranking >> load_to_bq >> ensure_identity_tables >> enrich_ranking_detail >> sync_ranking_detail >> cleanup >> notify_slack >> brand_ranking_report
+# 파이프라인: 랭킹/리뷰 수집 → BigQuery 적재 → 상세 보강/동기화 → 정리/알림/리포트
+crawl_ranking >> load_to_bq >> enrich_and_sync_detail >> finalize_run

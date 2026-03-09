@@ -20,8 +20,18 @@ DATASET_ID = "jaeho"
 RANKING_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking"
 IDENTITY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_identity"
 RETRY_TABLE_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_identity_retry"
+RANKING_HISTORY_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_history"
+PRODUCT_DETAIL_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_details"
+PRODUCT_DETAIL_RETRY_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_product_detail_retry_queue"
+LATEST_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_latest"
+MISSING_DETAIL_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_missing_details"
 FINAL_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_final_view"
 GAP_VIEW_ID = f"{PROJECT_ID}.{DATASET_ID}.oliveyoung_ranking_detail_gap_view"
+RANKING_HISTORY_VIEW_DESCRIPTION = "올리브영 랭킹 원본 히스토리 조회용 alias view"
+PRODUCT_DETAIL_VIEW_DESCRIPTION = "올리브영 상품 상세 최신 보강 조회용 alias view"
+PRODUCT_DETAIL_RETRY_VIEW_DESCRIPTION = "올리브영 상품 상세 보강 재시도 큐 조회용 alias view"
+LATEST_VIEW_DESCRIPTION = "올리브영 최신 논리 배치 기준 랭킹+상세 통합 조회 뷰"
+MISSING_DETAIL_VIEW_DESCRIPTION = "올리브영 최신 논리 배치 기준 상세 누락 상품 진단 뷰"
 FINAL_VIEW_DESCRIPTION = "올리브영 최신 논리 배치 기준 랭킹+상세 통합 조회 뷰"
 GAP_VIEW_DESCRIPTION = "올리브영 최신 논리 배치 기준 상세 누락 상품 진단 뷰"
 
@@ -186,8 +196,8 @@ joined AS (
 )
 """
 
-FINAL_VIEW_SQL = f"""
-CREATE OR REPLACE VIEW `{FINAL_VIEW_ID}` AS
+LATEST_VIEW_SQL = f"""
+CREATE OR REPLACE VIEW `{LATEST_VIEW_ID}` AS
 {COMMON_CTES}
 SELECT
   *,
@@ -200,8 +210,8 @@ SELECT
 FROM joined
 """
 
-GAP_VIEW_SQL = f"""
-CREATE OR REPLACE VIEW `{GAP_VIEW_ID}` AS
+MISSING_DETAIL_VIEW_SQL = f"""
+CREATE OR REPLACE VIEW `{MISSING_DETAIL_VIEW_ID}` AS
 {COMMON_CTES}
 SELECT
   *,
@@ -212,6 +222,36 @@ SELECT
   END AS detail_status
 FROM joined
 WHERE NOT detail_enriched
+"""
+
+RANKING_HISTORY_VIEW_SQL = f"""
+CREATE OR REPLACE VIEW `{RANKING_HISTORY_VIEW_ID}` AS
+SELECT *
+FROM `{RANKING_TABLE_ID}`
+"""
+
+PRODUCT_DETAIL_VIEW_SQL = f"""
+CREATE OR REPLACE VIEW `{PRODUCT_DETAIL_VIEW_ID}` AS
+SELECT *
+FROM `{IDENTITY_TABLE_ID}`
+"""
+
+PRODUCT_DETAIL_RETRY_VIEW_SQL = f"""
+CREATE OR REPLACE VIEW `{PRODUCT_DETAIL_RETRY_VIEW_ID}` AS
+SELECT *
+FROM `{RETRY_TABLE_ID}`
+"""
+
+FINAL_VIEW_SQL = f"""
+CREATE OR REPLACE VIEW `{FINAL_VIEW_ID}` AS
+SELECT *
+FROM `{LATEST_VIEW_ID}`
+"""
+
+GAP_VIEW_SQL = f"""
+CREATE OR REPLACE VIEW `{GAP_VIEW_ID}` AS
+SELECT *
+FROM `{MISSING_DETAIL_VIEW_ID}`
 """
 
 
@@ -273,20 +313,66 @@ def get_client() -> bigquery.Client:
 def create_views() -> None:
     client = get_client()
     field_descriptions = get_view_field_descriptions()
+    client.query(RANKING_HISTORY_VIEW_SQL).result()
+    print(f"view 생성 완료: {RANKING_HISTORY_VIEW_ID}")
+    apply_view_metadata(
+        client,
+        RANKING_HISTORY_VIEW_ID,
+        description=RANKING_HISTORY_VIEW_DESCRIPTION,
+        field_descriptions={field.name: field.description for field in get_ranking_schema()},
+    )
+
+    client.query(PRODUCT_DETAIL_VIEW_SQL).result()
+    print(f"view 생성 완료: {PRODUCT_DETAIL_VIEW_ID}")
+    apply_view_metadata(
+        client,
+        PRODUCT_DETAIL_VIEW_ID,
+        description=PRODUCT_DETAIL_VIEW_DESCRIPTION,
+        field_descriptions={field.name: field.description for field in get_identity_schema()},
+    )
+
+    client.query(PRODUCT_DETAIL_RETRY_VIEW_SQL).result()
+    print(f"view 생성 완료: {PRODUCT_DETAIL_RETRY_VIEW_ID}")
+    apply_view_metadata(
+        client,
+        PRODUCT_DETAIL_RETRY_VIEW_ID,
+        description=PRODUCT_DETAIL_RETRY_VIEW_DESCRIPTION,
+        field_descriptions={field.name: field.description for field in get_retry_schema()},
+    )
+
+    client.query(LATEST_VIEW_SQL).result()
+    print(f"view 생성 완료: {LATEST_VIEW_ID}")
+    apply_view_metadata(
+        client,
+        LATEST_VIEW_ID,
+        description=LATEST_VIEW_DESCRIPTION,
+        field_descriptions=field_descriptions,
+    )
+
+    client.query(MISSING_DETAIL_VIEW_SQL).result()
+    print(f"view 생성 완료: {MISSING_DETAIL_VIEW_ID}")
+    apply_view_metadata(
+        client,
+        MISSING_DETAIL_VIEW_ID,
+        description=MISSING_DETAIL_VIEW_DESCRIPTION,
+        field_descriptions=field_descriptions,
+    )
+
     client.query(FINAL_VIEW_SQL).result()
     print(f"view 생성 완료: {FINAL_VIEW_ID}")
     apply_view_metadata(
         client,
         FINAL_VIEW_ID,
-        description=FINAL_VIEW_DESCRIPTION,
+        description=f"{FINAL_VIEW_DESCRIPTION} (호환 alias)",
         field_descriptions=field_descriptions,
     )
+
     client.query(GAP_VIEW_SQL).result()
     print(f"view 생성 완료: {GAP_VIEW_ID}")
     apply_view_metadata(
         client,
         GAP_VIEW_ID,
-        description=GAP_VIEW_DESCRIPTION,
+        description=f"{GAP_VIEW_DESCRIPTION} (호환 alias)",
         field_descriptions=field_descriptions,
     )
 
